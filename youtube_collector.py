@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import random
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Iterable
+from urllib.parse import parse_qs, urlparse
 
-from asx_digest import LOG_FILE, fetch_url, load_config, parse_rss  # type: ignore
+from yt_dlp import YoutubeDL
+
+from asx_digest import LOG_FILE, load_config  # type: ignore
 from youtube_cache import (
     DEFAULT_FRESH_MINUTES,
+    is_fresh,
     load_cache,
     prune_cache,
     save_cache,
     update_entry,
-    is_fresh,
 )
 
 LOG = logging.getLogger("youtube_collector")
@@ -68,6 +73,132 @@ def select_sources(config: dict, requested: set[str] | None = None) -> list[tupl
     return sources
 
 
+def build_channel_urls(feed_url: str) -> list[str]:
+    if not feed_url:
+        return []
+
+    parsed = urlparse(feed_url)
+    qs = parse_qs(parsed.query)
+
+    urls: list[str] = []
+    channel_id = qs.get("channel_id", [None])[0]
+    if channel_id:
+        urls.append(f"https://www.youtube.com/channel/{channel_id}/videos")
+        if channel_id.startswith("UC") and len(channel_id) > 2:
+            uploads_id = "UU" + channel_id[2:]
+            urls.append(f"https://www.youtube.com/playlist?list={uploads_id}")
+
+    playlist_id = qs.get("playlist_id", [None])[0]
+    if playlist_id:
+        urls.append(f"https://www.youtube.com/playlist?list={playlist_id}")
+
+    urls.append(feed_url)
+
+    unique_urls: list[str] = []
+    for candidate in urls:
+        if candidate and candidate not in unique_urls:
+            unique_urls.append(candidate)
+    return unique_urls
+
+
+def fetch_channel_items(feed_url: str, source_name: str, max_items: int) -> list[dict]:
+    channel_urls = build_channel_urls(feed_url)
+    if not channel_urls:
+        return []
+
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": False,
+        "playlistend": max_items,
+        "ignoreerrors": True,
+        "noplaylist": False,
+        "nocheckcertificate": True,
+        "retries": 2,
+    }
+
+    entries: list[dict] = []
+    info = None
+    last_error: Exception | None = None
+
+    with YoutubeDL(ydl_opts) as ydl:
+        for channel_url in channel_urls:
+            try:
+                info = ydl.extract_info(channel_url, download=False)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "[YTCOL] yt-dlp error for %s (%s): %s",
+                    source_name,
+                    channel_url,
+                    exc,
+                )
+                last_error = exc
+                continue
+
+            if isinstance(info, dict):
+                entries = info.get("entries") or []
+                if entries:
+                    break
+            elif isinstance(info, list):
+                entries = info
+                if entries:
+                    break
+
+    if not entries:
+        if last_error:
+            LOG.warning("[YTCOL] yt-dlp failed to fetch entries for %s after %d attempt(s)", source_name, len(channel_urls))
+        return []
+
+    items: list[dict] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+
+        video_url = entry.get("webpage_url") or entry.get("url")
+        if not video_url:
+            video_id = entry.get("id")
+            if video_id:
+                video_url = f"https://www.youtube.com/watch?v={video_id}"
+        if not video_url:
+            continue
+
+        title = entry.get("title") or ""
+        description = (entry.get("description") or "")[:1000]
+
+        timestamp = entry.get("timestamp") or entry.get("release_timestamp")
+        upload_date = entry.get("upload_date") or entry.get("release_date")
+        pub_iso = None
+        if timestamp:
+            try:
+                dt = datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
+                pub_iso = dt.isoformat()
+            except (TypeError, ValueError, OSError):
+                pub_iso = None
+        if not pub_iso and upload_date and len(str(upload_date)) == 8:
+            try:
+                dt = datetime.strptime(str(upload_date), "%Y%m%d").replace(tzinfo=timezone.utc)
+                pub_iso = dt.isoformat()
+            except ValueError:
+                pub_iso = None
+
+        item_id = hashlib.md5((title + video_url).encode()).hexdigest()
+        items.append(
+            {
+                "id": item_id,
+                "title": title,
+                "link": video_url,
+                "description": description,
+                "source": source_name,
+                "pub_date": pub_iso,
+            }
+        )
+
+        if len(items) >= max_items:
+            break
+
+    return items
+
+
 def sleep_between(min_s: float, max_s: float, label: str) -> None:
     if max_s <= 0:
         return
@@ -110,13 +241,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         url = src.get("url")
         name = src.get("name", key)
         LOG.info("[YTCOL] Fetching %s...", name)
-        raw = fetch_url(url)
-        if not raw:
-            LOG.warning("[YTCOL] Fetch failed for %s", name)
+        items = fetch_channel_items(url, name, max_items)
+        if not items:
+            LOG.warning("[YTCOL] Fetch yielded no items for %s", name)
             continue
-
-        items = parse_rss(raw, name, max_age_hours, {})
-        items = items[:max_items]
 
         update_entry(cache, key, items)
         cache_updated = True
