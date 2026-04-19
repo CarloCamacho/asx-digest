@@ -1,0 +1,6 @@
+# Runtime artifacts
+logs/
+__pycache__/
+state.json*
+*.pyc
+*.bak

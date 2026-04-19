@@ -1,0 +1,136 @@
+{
+  "email": {
+    "method": "agentmail",
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "from_address": "YOUR_GMAIL@gmail.com",
+    "app_password": "YOUR_GMAIL_APP_PASSWORD",
+    "recipients": [
+      "ian.franklin@outlook.com",
+      "Kelly.Franklin@outlook.com.au"
+    ]
+  },
+  "agentmail": {
+    "_note": "Alternative to Gmail. Set method to 'agentmail' and fill these in.",
+    "api_key": "am_us_f38466dfb47cd767acd962207473f04a09df98da0fc9f1bbe6b2f18c903b7057",
+    "from_address": "claude_asx@agentmail.to",
+    "inbox_id": "claude_asx@agentmail.to"
+  },
+  "sources": {
+    "wealth_within_youtube": {
+      "enabled": true,
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCXZlK6gSJ_kXhDQpZa_LQtQ",
+      "name": "Wealth Within (YouTube)"
+    },
+    "livewire_markets_youtube": {
+      "enabled": true,
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCdLzNzag8APY4tx6GHYN2Lg",
+      "name": "Livewire Markets (YouTube)"
+    },
+    "market_index_youtube": {
+      "enabled": false,
+      "_note": "Channel not found \u2014 handle @marketindexau returned 404. Re-enable if correct ID is found.",
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCFx0MkMB5e_Zx3R9lc6T1eg",
+      "name": "Market Index (YouTube)"
+    },
+    "rask_youtube": {
+      "enabled": true,
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCzyu1ypvynNH6Q2l_YqVoaw",
+      "name": "Rask (YouTube)"
+    },
+    "finer_market_points_youtube": {
+      "enabled": true,
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC7N0NPq6REt_F7HOQOGgC9Q",
+      "name": "Finer Market Points (YouTube)"
+    },
+    "motley_fool_au_youtube": {
+      "enabled": false,
+      "_note": "Channel not found \u2014 handle @MotleyFoolAustralia returned 404. Re-enable if correct ID is found.",
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC-wsjOQTA1f3_oYrJxjEqwA",
+      "name": "Motley Fool Australia (YouTube)"
+    },
+    "asr_youtube": {
+      "enabled": true,
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC8L17Ygjsu9TBRP9SoUUq0g",
+      "name": "Australian Stock Report (YouTube)"
+    },
+    "commsec_tv_youtube": {
+      "enabled": true,
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC8Jc66lwfOT1CeXaEy3zEMw",
+      "name": "CommSecTV (YouTube)"
+    },
+    "stocks_down_under": {
+      "enabled": true,
+      "url": "https://stocksdownunder.com/feed/",
+      "name": "Stocks Down Under"
+    },
+    "stockhead": {
+      "enabled": true,
+      "url": "https://stockhead.com.au/feed/",
+      "name": "Stockhead"
+    },
+    "asx_bets_reddit": {
+      "enabled": true,
+      "url": "https://www.reddit.com/r/ASX_Bets/hot.json",
+      "url_new": "https://www.reddit.com/r/ASX_Bets/new.json",
+      "name": "r/ASX_Bets"
+    },
+    "the_market_herald": {
+      "enabled": true,
+      "url": "https://www.themarketherald.com.au/feed/",
+      "name": "The Market Herald"
+    },
+    "sharecafe": {
+      "enabled": true,
+      "url": "https://www.sharecafe.com.au/feed/",
+      "name": "ShareCafe"
+    },
+    "motley_fool_au": {
+      "enabled": true,
+      "url": "https://www.fool.com.au/feed/",
+      "name": "Motley Fool Australia"
+    },
+    "abc_business": {
+      "enabled": true,
+      "url": "https://www.abc.net.au/news/feed/51120/rss.xml",
+      "name": "ABC Business"
+    },
+    "smh_business": {
+      "enabled": true,
+      "url": "https://www.smh.com.au/rss/business.xml",
+      "name": "SMH Business"
+    },
+    "mining_com": {
+      "enabled": true,
+      "url": "https://www.mining.com/feed/",
+      "name": "Mining.com"
+    },
+    "hotcopper": {
+      "enabled": false,
+      "_note": "Disabled by default \u2014 HotCopper ToS prohibits automated scraping. Enable at your own discretion.",
+      "url": "https://hotcopper.com.au/",
+      "name": "HotCopper"
+    },
+    "asx_announcements": {
+      "enabled": false,
+      "name": "ASX Announcements",
+      "_note": "Disabled \u2014 ASX todayAnns.do endpoint returns HTML (Incapsula protected), not JSON. Replaced by The Market Herald, ShareCafe, and Motley Fool RSS feeds."
+    },
+    "price_signals": {
+      "enabled": true,
+      "name": "Price Signals",
+      "_note": "Scans ASX large caps for volume spikes and price breakouts via Yahoo Finance v8 chart API (per-symbol, no auth required)."
+    }
+  },
+  "market_snapshot": {
+    "enabled": true,
+    "symbols": ["^AXJO", "^AXMJ", "^AXEJ", "^AXFJ", "GC=F", "HG=F", "BZ=F", "ZW=F", "PLS.AX", "AUDUSD=X"]
+  },
+  "thresholds": {
+    "high_conviction_min_sources": 2,
+    "max_items_per_source": 20,
+    "max_age_hours": 168
+  },
+  "claude_cli_path": "/Users/ianf/.local/bin/claude",
+  "dry_run": false
+}
