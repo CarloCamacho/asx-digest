@@ -17,11 +17,22 @@ import xml.etree.ElementTree as ET
 import hashlib
 import logging
 import concurrent.futures
+import random
+import time
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from collections import defaultdict
+
+from youtube_cache import (
+    DEFAULT_FRESH_MINUTES as YT_FRESH_MINUTES,
+    is_fresh as cache_is_fresh,
+    load_cache as load_yt_cache,
+    prune_cache as prune_yt_cache,
+    save_cache as save_yt_cache,
+    update_entry as update_yt_entry,
+)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -41,6 +52,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 DRY_RUN = "--dry-run" in sys.argv
+CACHE_ONLY = "--cache-only" in sys.argv
+YT_SLEEP_RANGE = (3.0, 6.0)
 
 
 # ── Config & State ────────────────────────────────────────────────────────────
@@ -216,6 +229,36 @@ def parse_rss(xml_text, source_name, max_age_hours, seen_ids):
     except Exception as e:
         log.warning(f"RSS parse error for {source_name}: {e}")
     return items
+
+
+def _parse_iso_timestamp(value):
+    if not value:
+        return None
+    try:
+        value = value.replace("Z", "+00:00")
+        ts = datetime.fromisoformat(value)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+    except ValueError:
+        return None
+
+
+def filter_cached_items(items, source_name, seen_ids, max_age_hours):
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    source_seen = seen_ids.get(source_name, set())
+    if isinstance(source_seen, list):
+        source_seen = set(source_seen)
+    filtered = []
+    for item in items:
+        item_id = item.get("id")
+        if not item_id or item_id in source_seen:
+            continue
+        pub_date = _parse_iso_timestamp(item.get("pub_date"))
+        if pub_date and pub_date < cutoff:
+            continue
+        filtered.append(item)
+    return filtered
 
 
 def fetch_reddit(url, source_name, max_age_hours, seen_ids):
@@ -1203,6 +1246,9 @@ def main():
         active = sum(1 for v in snapshot.values() if v)
         log.info(f"  Snapshot: {active} symbols fetched")
 
+    yt_cache = load_yt_cache()
+    cache_dirty = False
+    missing_cache_sources = []
     all_new_items = []
 
     # ── YouTube RSS sources ──
@@ -1213,8 +1259,40 @@ def main():
         if key in ("asx_bets_reddit", "asx_announcements", "price_signals"):
             continue  # handled separately
 
+        url = src.get("url", "")
+        if "youtube.com/feeds/videos.xml" in url:
+            entry = yt_cache.get(key)
+            if entry and cache_is_fresh(entry, YT_FRESH_MINUTES):
+                cached_items = filter_cached_items(entry.get("items", []), name, seen_ids, max_age)
+                log.info(
+                    f"  Using cached {len(cached_items)} item(s) for {name} "
+                    f"(fetched {entry.get('fetched_at', 'unknown')})"
+                )
+                all_new_items.extend(cached_items[:max_items])
+            else:
+                if CACHE_ONLY:
+                    log.warning(f"Cache-only mode: no fresh cache for {name}")
+                    missing_cache_sources.append(name)
+                    continue
+                if YT_SLEEP_RANGE[1] > 0:
+                    sleep_dur = random.uniform(*YT_SLEEP_RANGE)
+                    log.info(f"Sleeping {sleep_dur:.1f}s before live fetch of {name}")
+                    time.sleep(sleep_dur)
+                log.info(f"Fetching {name} (live)...")
+                raw = fetch_url(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"})
+                if not raw:
+                    log.warning(f"Skipped {name} — fetch failed")
+                    continue
+                items = parse_rss(raw, name, max_age, seen_ids)
+                items = items[:max_items]
+                log.info(f"  {len(items)} new items from {name}")
+                all_new_items.extend(items)
+                update_yt_entry(yt_cache, key, items)
+                cache_dirty = True
+            continue
+
         log.info(f"Fetching {name}...")
-        raw = fetch_url(src["url"], headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"})
+        raw = fetch_url(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"})
         if not raw:
             log.warning(f"Skipped {name} — fetch failed")
             continue
@@ -1222,6 +1300,14 @@ def main():
         items = items[:max_items]
         log.info(f"  {len(items)} new items from {name}")
         all_new_items.extend(items)
+
+    if cache_dirty:
+        yt_cache = prune_yt_cache(yt_cache, max_age)
+        save_yt_cache(yt_cache)
+        log.info("Updated YouTube cache")
+    if CACHE_ONLY and missing_cache_sources:
+        log.error("Cache-only mode: missing fresh cache for: %s", ", ".join(missing_cache_sources))
+        raise SystemExit(2)
 
     # ── Reddit ──
     reddit_cfg = config["sources"].get("asx_bets_reddit", {})
