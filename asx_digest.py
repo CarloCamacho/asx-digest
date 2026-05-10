@@ -23,6 +23,7 @@ import time
 import io
 import csv
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from email.utils import parsedate_to_datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -62,6 +63,9 @@ log = logging.getLogger(__name__)
 DRY_RUN = "--dry-run" in sys.argv
 CACHE_ONLY = "--cache-only" in sys.argv
 YT_SLEEP_RANGE = (3.0, 6.0)
+AEST = ZoneInfo("Australia/Sydney")
+_BOT_UA = "Python/ASXDigest"
+_SCRAPER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 
 # ── Config & State ────────────────────────────────────────────────────────────
@@ -186,19 +190,20 @@ def parse_rss(xml_text, source_name, max_age_hours, seen_ids):
         # Handle both RSS <item> and Atom <entry>
         entries = root.findall(".//item") or root.findall(".//atom:entry", ns)
 
-        for entry in entries:
-            def find_first(el, tags):
-                for tag in tags:
-                    # Try without namespaces first (plain RSS elements)
-                    found = el.find(tag)
+        def find_first(el, tags):
+            for tag in tags:
+                # Try without namespaces first (plain RSS elements)
+                found = el.find(tag)
+                if found is not None:
+                    return found
+                # Then try with namespace dict (Atom elements like atom:title)
+                if ":" in tag:
+                    found = el.find(tag, ns)
                     if found is not None:
                         return found
-                    # Then try with namespace dict (Atom elements like atom:title)
-                    if ":" in tag:
-                        found = el.find(tag, ns)
-                        if found is not None:
-                            return found
-                return None
+            return None
+
+        for entry in entries:
 
             # Title
             title_el = find_first(entry, ["title", "atom:title"])
@@ -293,7 +298,7 @@ def filter_cached_items(items, source_name, seen_ids, max_age_hours):
 def fetch_reddit(url, source_name, max_age_hours, seen_ids):
     """Fetch Reddit JSON listing, return new posts."""
     items = []
-    raw = fetch_url(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"})
+    raw = fetch_url(url, headers={"User-Agent": _BOT_UA})
     if not raw:
         return items
     try:
@@ -332,7 +337,7 @@ def fetch_asx_announcements(seen_ids, max_age_hours):
     """Fetch today's ASX price-sensitive announcements from the official API."""
     items = []
     raw = fetch_url(ASX_ANNS_URL, headers={
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "User-Agent": _SCRAPER_UA,
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://www.asx.com.au/",
     })
@@ -358,13 +363,10 @@ def fetch_asx_announcements(seen_ids, max_age_hours):
             ts_str = ann.get("timeStamp", "")
             pub_date = None
             if ts_str:
-                for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"]:
-                    try:
-                        pub_date = datetime.strptime(ts_str[:19], "%Y-%m-%dT%H:%M:%S")
-                        pub_date = pub_date.replace(tzinfo=timezone.utc)
-                        break
-                    except ValueError:
-                        continue
+                try:
+                    pub_date = datetime.strptime(ts_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pub_date = None
             if pub_date and pub_date < cutoff:
                 continue
 
@@ -995,6 +997,8 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
 
         # Assign analysts BEFORE filtering: 3 analysts × 6 picks each = 18 total
         # The Bull always has exactly this structure: first 6 = analyst 1, etc.
+        if len(analyst_picks) != 18:
+            log.warning(f"The Bull: expected 18 picks for analyst assignment, got {len(analyst_picks)} — analyst labels may be misaligned")
         for i, pick in enumerate(analyst_picks):
             if i < 6 and len(h2_names) > 0:
                 pick["analyst"] = h2_names[0]
@@ -1365,7 +1369,7 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
     high = [s for s in aggregated if s["high_conviction"] and not s.get("sector_play")]
     single = [s for s in aggregated if not s["high_conviction"] and not s.get("sector_play")]
     sector_plays = [s for s in aggregated if s.get("sector_play")]
-    aest = run_time.astimezone(timezone(timedelta(hours=11)))
+    aest = run_time.astimezone(AEST)
     date_str = aest.strftime("%a %d %b %Y")
     time_str = aest.strftime("%I:%M%p AEST")
 
@@ -1718,7 +1722,7 @@ def main():
     claude = config["claude_cli_path"]
 
     # Determine run mode (morning briefing vs evening wrap-up) based on current hour in AEST
-    now_aest = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=11)))
+    now_aest = datetime.now(timezone.utc).astimezone(AEST)
     hour = now_aest.hour
     # Morning run: 6-11am, Evening run: 3-8pm (handles 8AM and 5PM cron times with buffer)
     run_mode = "morning" if 6 <= hour < 15 else "evening"
@@ -1765,7 +1769,7 @@ def main():
                     log.info(f"Sleeping {sleep_dur:.1f}s before live fetch of {name}")
                     time.sleep(sleep_dur)
                 log.info(f"Fetching {name} (live)...")
-                raw = fetch_url(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"})
+                raw = fetch_url(url, headers={"User-Agent": _SCRAPER_UA})
                 if not raw:
                     log.warning(f"Skipped {name} — fetch failed")
                     continue
@@ -1778,7 +1782,7 @@ def main():
             continue
 
         log.info(f"Fetching {name}...")
-        raw = fetch_url(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"})
+        raw = fetch_url(url, headers={"User-Agent": _SCRAPER_UA})
         if not raw:
             log.warning(f"Skipped {name} — fetch failed")
             continue
@@ -1834,7 +1838,7 @@ def main():
         all_new_items.extend(deduped)
 
     # ── ASX Official Announcements ──
-    if config["sources"].get("asx_announcements", {}).get("enabled", True):
+    if config["sources"].get("asx_announcements", {}).get("enabled", False):
         log.info("Fetching ASX price-sensitive announcements...")
         ann_items = fetch_asx_announcements(seen_ids, max_age)
         all_new_items.extend(ann_items)
@@ -1969,9 +1973,9 @@ def main():
     high_count = sum(1 for s in aggregated if s["high_conviction"] and not s.get("sector_play"))
     stock_count = len([s for s in aggregated if not s.get("sector_play")])
     if run_mode == "morning":
-        subject = f"ASX Morning Briefing — {run_time.astimezone(timezone(timedelta(hours=11))).strftime('%a %d %b')}"
+        subject = f"ASX Morning Briefing — {run_time.astimezone(AEST).strftime('%a %d %b')}"
     else:
-        subject = f"ASX Evening Wrap — {run_time.astimezone(timezone(timedelta(hours=11))).strftime('%a %d %b')}"
+        subject = f"ASX Evening Wrap — {run_time.astimezone(AEST).strftime('%a %d %b')}"
     if high_count:
         subject += f" · {high_count} HIGH CONVICTION"
     elif stock_count:
