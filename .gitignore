@@ -10,3 +10,4 @@ data/youtube_cache.json
 # Secrets — use .env for local keys (see .env.example)
 config.json
 .env
+.claude/
