@@ -15,6 +15,7 @@ import urllib.parse
 import smtplib
 import xml.etree.ElementTree as ET
 import hashlib
+import html as _html
 import logging
 import concurrent.futures
 import random
@@ -22,6 +23,7 @@ import time
 import io
 import csv
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from email.utils import parsedate_to_datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -36,6 +38,10 @@ from youtube_cache import (
     save_cache as save_yt_cache,
     update_entry as update_yt_entry,
 )
+
+def h(text) -> str:
+    """Escape text for safe HTML interpolation."""
+    return _html.escape(str(text or ""))
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -54,15 +60,26 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DRY_RUN = "--dry-run" in sys.argv
-CACHE_ONLY = "--cache-only" in sys.argv
 YT_SLEEP_RANGE = (3.0, 6.0)
+AEST = ZoneInfo("Australia/Sydney")
+_BOT_UA = "Python/ASXDigest"
+_SCRAPER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 
 # ── Config & State ────────────────────────────────────────────────────────────
 def load_config():
     with open(CONFIG_FILE) as f:
-        return json.load(f)
+        config = json.load(f)
+    # Load secrets/paths from env vars if not set in config
+    agentmail = config.get("agentmail", {})
+    if not agentmail.get("api_key"):
+        agentmail["api_key"] = os.environ.get("AGENTMAIL_API_KEY", "")
+        config["agentmail"] = agentmail
+    if not config.get("claude_cli_path"):
+        config["claude_cli_path"] = os.environ.get("CLAUDE_CLI_PATH", "claude")
+    if not config.get("claude_model"):
+        config["claude_model"] = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+    return config
 
 def load_state():
     if STATE_FILE.exists():
@@ -85,8 +102,15 @@ def save_state(state):
         ]
         if not state["historical_picks"][ticker]:
             del state["historical_picks"][ticker]
-    with open(STATE_FILE, "w") as f:
+    # Prune seen_ids to last 500 per source to prevent unbounded growth
+    for src in state.get("seen_ids", {}):
+        ids = state["seen_ids"][src]
+        if len(ids) > 500:
+            state["seen_ids"][src] = ids[-500:]
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_FILE)
 
 
 # ── YouTube Transcript Extraction ─────────────────────────────────────────────
@@ -173,19 +197,20 @@ def parse_rss(xml_text, source_name, max_age_hours, seen_ids):
         # Handle both RSS <item> and Atom <entry>
         entries = root.findall(".//item") or root.findall(".//atom:entry", ns)
 
-        for entry in entries:
-            def find_first(el, tags):
-                for tag in tags:
-                    # Try without namespaces first (plain RSS elements)
-                    found = el.find(tag)
+        def find_first(el, tags):
+            for tag in tags:
+                # Try without namespaces first (plain RSS elements)
+                found = el.find(tag)
+                if found is not None:
+                    return found
+                # Then try with namespace dict (Atom elements like atom:title)
+                if ":" in tag:
+                    found = el.find(tag, ns)
                     if found is not None:
                         return found
-                    # Then try with namespace dict (Atom elements like atom:title)
-                    if ":" in tag:
-                        found = el.find(tag, ns)
-                        if found is not None:
-                            return found
-                return None
+            return None
+
+        for entry in entries:
 
             # Title
             title_el = find_first(entry, ["title", "atom:title"])
@@ -203,7 +228,6 @@ def parse_rss(xml_text, source_name, max_age_hours, seen_ids):
             desc_el = find_first(entry, ["description", "summary", "atom:summary", "content:encoded"])
             description = ""
             if desc_el is not None and desc_el.text:
-                import re
                 description = re.sub(r"<[^>]+>", " ", desc_el.text).strip()[:1000]
 
             # Date
@@ -226,7 +250,7 @@ def parse_rss(xml_text, source_name, max_age_hours, seen_ids):
             if pub_date and pub_date < cutoff:
                 continue
 
-            item_id = hashlib.md5((title + link).encode()).hexdigest()
+            item_id = hashlib.md5((title + link).encode(), usedforsecurity=False).hexdigest()
             source_seen = seen_ids.get(source_name, set())
             if isinstance(source_seen, list):
                 source_seen = set(source_seen)
@@ -280,7 +304,7 @@ def filter_cached_items(items, source_name, seen_ids, max_age_hours):
 def fetch_reddit(url, source_name, max_age_hours, seen_ids):
     """Fetch Reddit JSON listing, return new posts."""
     items = []
-    raw = fetch_url(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"})
+    raw = fetch_url(url, headers={"User-Agent": _BOT_UA})
     if not raw:
         return items
     try:
@@ -319,7 +343,7 @@ def fetch_asx_announcements(seen_ids, max_age_hours):
     """Fetch today's ASX price-sensitive announcements from the official API."""
     items = []
     raw = fetch_url(ASX_ANNS_URL, headers={
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "User-Agent": _SCRAPER_UA,
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://www.asx.com.au/",
     })
@@ -345,17 +369,14 @@ def fetch_asx_announcements(seen_ids, max_age_hours):
             ts_str = ann.get("timeStamp", "")
             pub_date = None
             if ts_str:
-                for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"]:
-                    try:
-                        pub_date = datetime.strptime(ts_str[:19], "%Y-%m-%dT%H:%M:%S")
-                        pub_date = pub_date.replace(tzinfo=timezone.utc)
-                        break
-                    except ValueError:
-                        continue
+                try:
+                    pub_date = datetime.strptime(ts_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pub_date = None
             if pub_date and pub_date < cutoff:
                 continue
 
-            item_id = hashlib.md5((ticker + headline).encode()).hexdigest()
+            item_id = hashlib.md5((ticker + headline).encode(), usedforsecurity=False).hexdigest()
             if item_id in source_seen:
                 continue
 
@@ -462,7 +483,7 @@ def fetch_price_signals(extra_tickers=None, seen_ids=None):
         if not signals:
             continue
 
-        item_id = hashlib.md5((ticker + today_str).encode()).hexdigest()
+        item_id = hashlib.md5((ticker + today_str).encode(), usedforsecurity=False).hexdigest()
         if item_id in source_seen:
             continue
 
@@ -636,7 +657,7 @@ Rules:
 - Output ONLY the JSON line, nothing else"""
 
 
-def run_intelligence_pass(all_items, snapshot, run_mode, claude_path):
+def run_intelligence_pass(all_items, snapshot, run_mode, claude_path, claude_model="claude-haiku-4-5-20251001"):
     """Pass 1: single Claude call producing market intelligence context.
     Returns a dict with narrative, mining_pulse, sectors, commodities, buzz_topics, sentiment.
     Returns a safe fallback dict on failure.
@@ -668,7 +689,7 @@ def run_intelligence_pass(all_items, snapshot, run_mode, claude_path):
 
     try:
         result = subprocess.run(
-            [claude_path, "--print", "--model", "claude-haiku-4-5-20251001"],
+            [claude_path, "--print", "--model", claude_model],
             input=prompt, capture_output=True, text=True, timeout=90
         )
         if result.returncode != 0:
@@ -787,7 +808,7 @@ def fetch_asic_shorts(seen_ids=None):
         if not flags:
             continue
 
-        item_id = hashlib.md5(f"asic_short_{ticker}_{d.strftime('%Y%m%d')}".encode()).hexdigest()[:12]
+        item_id = hashlib.md5(f"asic_short_{ticker}_{d.strftime('%Y%m%d')}".encode(), usedforsecurity=False).hexdigest()[:12]
         if item_id in source_seen:
             continue
 
@@ -836,7 +857,7 @@ def fetch_director_trades(tickers=None, seen_ids=None):
                     "change of director", "appendix 3y", "director interest"
                 ]):
                     doc_key = ann.get("documentKey", "")
-                    item_id = hashlib.md5(f"dir_{ticker}_{doc_key}".encode()).hexdigest()[:12]
+                    item_id = hashlib.md5(f"dir_{ticker}_{doc_key}".encode(), usedforsecurity=False).hexdigest()[:12]
                     if item_id not in source_seen:
                         results.append({
                             "ticker": ticker,
@@ -923,8 +944,8 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
             pass
 
         # Dedup check
-        article_id = hashlib.sha256(article_url.encode()).hexdigest()[:16]
-        if article_id in seen_ids.get("The Bull 18 Share Tips", []):
+        article_id = hashlib.sha256(article_url.encode(), usedforsecurity=False).hexdigest()[:16]
+        if article_id in set(seen_ids.get("The Bull 18 Share Tips", [])):
             log.info("  The Bull: already seen")
             return items
 
@@ -982,6 +1003,8 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
 
         # Assign analysts BEFORE filtering: 3 analysts × 6 picks each = 18 total
         # The Bull always has exactly this structure: first 6 = analyst 1, etc.
+        if len(analyst_picks) != 18:
+            log.warning(f"The Bull: expected 18 picks for analyst assignment, got {len(analyst_picks)} — analyst labels may be misaligned")
         for i, pick in enumerate(analyst_picks):
             if i < 6 and len(h2_names) > 0:
                 pick["analyst"] = h2_names[0]
@@ -1080,7 +1103,7 @@ def looks_like_stock_pick(item):
         return has_strong or has_weak
 
 
-def analyze_batch(items, claude_path, batch_size=5, market_context=""):
+def analyze_batch(items, claude_path, batch_size=5, market_context="", claude_model="claude-haiku-4-5-20251001"):
     """Analyze a batch of items in a single Claude call. Returns list of picks."""
     if not items:
         return []
@@ -1100,7 +1123,7 @@ def analyze_batch(items, claude_path, batch_size=5, market_context=""):
     )
     try:
         result = subprocess.run(
-            [claude_path, "--print", "--model", "claude-haiku-4-5-20251001"],
+            [claude_path, "--print", "--model", claude_model],
             input=prompt, capture_output=True, text=True, timeout=120
         )
         if result.returncode != 0:
@@ -1142,8 +1165,8 @@ def analyze_batch(items, claude_path, batch_size=5, market_context=""):
             return []
         mid = len(items) // 2
         return (
-            analyze_batch(items[:mid], claude_path, batch_size, market_context) +
-            analyze_batch(items[mid:], claude_path, batch_size, market_context)
+            analyze_batch(items[:mid], claude_path, batch_size, market_context, claude_model) +
+            analyze_batch(items[mid:], claude_path, batch_size, market_context, claude_model)
         )
     except Exception as e:
         log.warning(f"Claude batch error: {e}")
@@ -1352,7 +1375,7 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
     high = [s for s in aggregated if s["high_conviction"] and not s.get("sector_play")]
     single = [s for s in aggregated if not s["high_conviction"] and not s.get("sector_play")]
     sector_plays = [s for s in aggregated if s.get("sector_play")]
-    aest = run_time.astimezone(timezone(timedelta(hours=11)))
+    aest = run_time.astimezone(AEST)
     date_str = aest.strftime("%a %d %b %Y")
     time_str = aest.strftime("%I:%M%p AEST")
 
@@ -1500,7 +1523,7 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
         html_parts.append(
             f"<div style='background:#f0f4ff;padding:12px 16px;border-radius:6px;margin-bottom:12px;'>"
             f"<b style='font-size:13px;color:#555;'>{narrative_header}</b>"
-            f"<p style='margin:6px 0 4px 0;font-size:14px;color:#222;'>{narrative}</p>"
+            f"<p style='margin:6px 0 4px 0;font-size:14px;color:#222;'>{h(narrative)}</p>"
         )
         if sentiment:
             sent_color = {"bullish": "#27ae60", "cautiously bullish": "#2ecc71",
@@ -1518,7 +1541,7 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
         f"<b style='font-size:13px;'>⛏️ Mining Pulse</b> "
         f"<span style='background:{mp_color};color:white;font-size:11px;padding:2px 7px;border-radius:10px;margin-left:6px;'>"
         f"{mining_pulse.get('signal','quiet').upper()}</span>"
-        f"<p style='margin:6px 0 0 0;font-size:13px;color:#444;'>{mining_pulse.get('reason','')}</p>"
+        f"<p style='margin:6px 0 0 0;font-size:13px;color:#444;'>{h(mining_pulse.get('reason',''))}</p>"
         f"</div>"
     )
 
@@ -1531,7 +1554,7 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
             html_parts.append(
                 f"<tr><td style='padding:4px 8px;font-weight:bold;width:120px;'>{s['name']}</td>"
                 f"<td style='color:{sig_color};width:24px;'>{arrow}</td>"
-                f"<td style='color:#555;padding:4px;'>{s['reason']}</td></tr>"
+                f"<td style='color:#555;padding:4px;'>{h(s['reason'])}</td></tr>"
             )
         html_parts.append("</table></div>")
 
@@ -1547,14 +1570,14 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
                 f"<tr><td style='padding:3px 8px;width:130px;'>{c['name']}</td>"
                 f"<td style='font-weight:bold;width:100px;'>{price_str}</td>"
                 f"<td style='color:{chg_color};width:60px;'>{chg_str}</td>"
-                f"<td style='color:#888;'>{c.get('note','')}</td></tr>"
+                f"<td style='color:#888;'>{h(c.get('note',''))}</td></tr>"
             )
         html_parts.append("</table></div>")
 
     # Buzz topics
     if buzz_topics:
         topic_pills = " ".join(
-            f"<span style='background:#e8f4fd;color:#2980b9;padding:2px 8px;border-radius:10px;font-size:11px;margin:2px;display:inline-block;'>{t}</span>"
+            f"<span style='background:#e8f4fd;color:#2980b9;padding:2px 8px;border-radius:10px;font-size:11px;margin:2px;display:inline-block;'>{h(t)}</span>"
             for t in buzz_topics
         )
         html_parts.append(
@@ -1593,20 +1616,20 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
         if alignment and alignment != "—":
             parts.append(f"<br><span style='font-size:11px;color:#666;'>{alignment}</span>")
         if s.get("summary"):
-            parts.append(f"<p style='margin:8px 0 4px 0;font-size:14px;color:#222;'><b>Thesis:</b> {s['summary']}</p>")
+            parts.append(f"<p style='margin:8px 0 4px 0;font-size:14px;color:#222;'><b>Thesis:</b> {h(s['summary'])}</p>")
         if s.get("catalysts"):
             parts.append("<p style='margin:6px 0 2px 0;font-size:12px;font-weight:bold;color:#555;'>Catalysts</p><ul style='margin:0;padding-left:18px;font-size:13px;color:#333;'>")
             for c in s["catalysts"]:
-                parts.append(f"<li>{c}</li>")
+                parts.append(f"<li>{h(c)}</li>")
             parts.append("</ul>")
         if s.get("risks"):
             parts.append("<p style='margin:6px 0 2px 0;font-size:12px;font-weight:bold;color:#c0392b;'>Risks</p><ul style='margin:0;padding-left:18px;font-size:13px;color:#555;'>")
             for r in s["risks"]:
-                parts.append(f"<li>{r}</li>")
+                parts.append(f"<li>{h(r)}</li>")
             parts.append("</ul>")
         if s.get("source_quotes"):
             parts.append("<p style='margin:6px 0 2px 0;font-size:12px;font-weight:bold;color:#555;'>Key Quote</p>")
-            parts.append(f"<p style='margin:2px 0;font-size:12px;color:#444;font-style:italic;'>&#8220;{s['source_quotes'][0]}&#8221;</p>")
+            parts.append(f"<p style='margin:2px 0;font-size:12px;color:#444;font-style:italic;'>&#8220;{h(s['source_quotes'][0])}&#8221;</p>")
         parts.append("<p style='margin:6px 0 0 0;'>")
         for m in s["mentions"]:
             if m.get("source_link"):
@@ -1696,6 +1719,8 @@ def send_email(plain, html, subject, config):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    DRY_RUN = "--dry-run" in sys.argv
+    CACHE_ONLY = "--cache-only" in sys.argv
     log.info(f"=== ASXDigest run started {'(DRY RUN)' if DRY_RUN else ''} ===")
     config = load_config()
     state = load_state()
@@ -1703,9 +1728,10 @@ def main():
     max_age = config["thresholds"]["max_age_hours"]
     max_items = config["thresholds"]["max_items_per_source"]
     claude = config["claude_cli_path"]
+    claude_model = config.get("claude_model", "claude-haiku-4-5-20251001")
 
     # Determine run mode (morning briefing vs evening wrap-up) based on current hour in AEST
-    now_aest = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=11)))
+    now_aest = datetime.now(timezone.utc).astimezone(AEST)
     hour = now_aest.hour
     # Morning run: 6-11am, Evening run: 3-8pm (handles 8AM and 5PM cron times with buffer)
     run_mode = "morning" if 6 <= hour < 15 else "evening"
@@ -1752,7 +1778,7 @@ def main():
                     log.info(f"Sleeping {sleep_dur:.1f}s before live fetch of {name}")
                     time.sleep(sleep_dur)
                 log.info(f"Fetching {name} (live)...")
-                raw = fetch_url(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"})
+                raw = fetch_url(url, headers={"User-Agent": _SCRAPER_UA})
                 if not raw:
                     log.warning(f"Skipped {name} — fetch failed")
                     continue
@@ -1765,7 +1791,7 @@ def main():
             continue
 
         log.info(f"Fetching {name}...")
-        raw = fetch_url(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"})
+        raw = fetch_url(url, headers={"User-Agent": _SCRAPER_UA})
         if not raw:
             log.warning(f"Skipped {name} — fetch failed")
             continue
@@ -1821,7 +1847,7 @@ def main():
         all_new_items.extend(deduped)
 
     # ── ASX Official Announcements ──
-    if config["sources"].get("asx_announcements", {}).get("enabled", True):
+    if config["sources"].get("asx_announcements", {}).get("enabled", False):
         log.info("Fetching ASX price-sensitive announcements...")
         ann_items = fetch_asx_announcements(seen_ids, max_age)
         all_new_items.extend(ann_items)
@@ -1866,21 +1892,11 @@ def main():
         save_state(state)
         return
 
-    # ── Mark all items as seen immediately ──
-    for item in all_new_items:
-        src_name = item["source"]
-        if src_name not in seen_ids:
-            seen_ids[src_name] = []
-        if isinstance(seen_ids[src_name], set):
-            seen_ids[src_name] = list(seen_ids[src_name])
-        if item["id"] not in seen_ids[src_name]:
-            seen_ids[src_name].append(item["id"])
-
     # ── Pass 1: Market Intelligence ──
     intel = {}
     if all_new_items or snapshot:
         log.info("Running market intelligence pass (Pass 1)...")
-        intel = run_intelligence_pass(all_new_items, snapshot, run_mode, claude)
+        intel = run_intelligence_pass(all_new_items, snapshot, run_mode, claude, claude_model)
         log.info(f"  Sentiment: {intel.get('sentiment','?')} | Mining: {intel.get('mining_pulse',{}).get('signal','?')}")
 
     # Build market context string for Pass 2
@@ -1909,12 +1925,10 @@ def main():
         batch = filtered_items[i:i + batch_size]
         n_batches = (len(filtered_items) - 1) // batch_size + 1
         log.info(f"  Batch {i // batch_size + 1}/{n_batches} ({len(batch)} items)...")
-        picks = analyze_batch(batch, claude, batch_size, market_context)
+        picks = analyze_batch(batch, claude, batch_size, market_context, claude_model)
         if picks:
             log.info(f"    → {len(picks)} pick(s): {[p['ticker'] for p in picks]}")
         all_picks.extend(picks)
-
-    state["seen_ids"] = seen_ids
 
     # Send if there are picks, OR if the mining pulse / sectors are notable
     mining_signal = intel.get("mining_pulse", {}).get("signal", "quiet")
@@ -1935,19 +1949,6 @@ def main():
     log.info(f"Aggregated: {len(aggregated)} unique stocks "
              f"({sum(1 for s in aggregated if s['high_conviction'])} high conviction)")
     
-    # Record current picks to historical_picks for future inter-day correlation
-    now_iso = datetime.now(timezone.utc).isoformat()
-    for pick in all_picks:
-        ticker = pick.get("ticker", "").upper().strip()
-        if ticker and 2 <= len(ticker) <= 5:
-            if ticker not in state.get("historical_picks", {}):
-                state["historical_picks"][ticker] = []
-            state["historical_picks"][ticker].append({
-                "source": pick.get("source", ""),
-                "timestamp": now_iso,
-                "signal": pick.get("signal", "BUY"),
-            })
-    
     assign_sector_alignment(aggregated, intel)
 
     # ── Format & Send ──
@@ -1956,9 +1957,9 @@ def main():
     high_count = sum(1 for s in aggregated if s["high_conviction"] and not s.get("sector_play"))
     stock_count = len([s for s in aggregated if not s.get("sector_play")])
     if run_mode == "morning":
-        subject = f"ASX Morning Briefing — {run_time.astimezone(timezone(timedelta(hours=11))).strftime('%a %d %b')}"
+        subject = f"ASX Morning Briefing — {run_time.astimezone(AEST).strftime('%a %d %b')}"
     else:
-        subject = f"ASX Evening Wrap — {run_time.astimezone(timezone(timedelta(hours=11))).strftime('%a %d %b')}"
+        subject = f"ASX Evening Wrap — {run_time.astimezone(AEST).strftime('%a %d %b')}"
     if high_count:
         subject += f" · {high_count} HIGH CONVICTION"
     elif stock_count:
@@ -1971,14 +1972,44 @@ def main():
     if DRY_RUN:
         log.info("DRY RUN — printing digest, not sending email:")
         print("\n" + plain)
+        email_sent = True
     else:
+        email_sent = False
         try:
             send_email(plain, html, subject, config)
+            email_sent = True
         except Exception as e:
             log.error(f"Email send failed: {e}")
             log.info("Digest (not sent):\n" + plain)
 
-    save_state(state)
+    if email_sent:
+        # Mark items as seen and record picks only after successful send
+        for item in all_new_items:
+            src_name = item["source"]
+            if src_name not in seen_ids:
+                seen_ids[src_name] = []
+            if isinstance(seen_ids[src_name], set):
+                seen_ids[src_name] = list(seen_ids[src_name])
+            if item["id"] not in seen_ids[src_name]:
+                seen_ids[src_name].append(item["id"])
+        state["seen_ids"] = seen_ids
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for pick in all_picks:
+            ticker = pick.get("ticker", "").upper().strip()
+            if ticker and 2 <= len(ticker) <= 5:
+                if ticker not in state.get("historical_picks", {}):
+                    state["historical_picks"][ticker] = []
+                state["historical_picks"][ticker].append({
+                    "source": pick.get("source", ""),
+                    "timestamp": now_iso,
+                    "signal": pick.get("signal", "BUY"),
+                })
+
+        save_state(state)
+    else:
+        log.warning("Email failed — items not marked as seen and will be retried on next run")
+
     log.info(f"=== ASXDigest run complete ===")
 
 

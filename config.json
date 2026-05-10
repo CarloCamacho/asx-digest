@@ -9,7 +9,7 @@
   },
   "agentmail": {
     "_note": "Alternative to Gmail. Set method to 'agentmail' and fill these in.",
-    "api_key": "am_us_f38466dfb47cd767acd962207473f04a09df98da0fc9f1bbe6b2f18c903b7057",
+    "api_key": "",
     "from_address": "claude_asx@agentmail.to",
     "inbox_id": "claude_asx@agentmail.to"
   },
@@ -128,5 +128,6 @@
     "max_age_hours": 168
   },
   "claude_cli_path": "/Users/ianf/.local/bin/claude",
+  "claude_model": "claude-haiku-4-5-20251001",
   "dry_run": false
 }
