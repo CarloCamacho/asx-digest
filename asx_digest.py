@@ -1102,8 +1102,11 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
 
         # Step 4: Extract analyst sections and their picks
         # Structure: H4 headings contain <span>BUY – </span>Company (TICKER)
-        # Strip all HTML tags first, then match patterns on clean text
-        h4_headings_raw = re.findall(r"<h4[^>]*>(.*?)</h4>", article_html, re.DOTALL)
+        # Capture each H4 + the paragraphs that follow it (analyst rationale)
+        h4_sections = re.findall(
+            r"<h4[^>]*>(.*?)</h4>(.*?)(?=<h4|<h2|</article>)",
+            article_html, re.DOTALL
+        )
 
         # Group into analyst sections by tracking H2 positions
         h2_names = []
@@ -1126,7 +1129,7 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
 
         analyst_picks = []
 
-        for raw_h4 in h4_headings_raw:
+        for raw_h4, following_html in h4_sections:
             # Strip all HTML tags and decode entities
             clean = re.sub(r"<[^>]+>", "", raw_h4).strip()
             clean = clean.replace("\xa0", " ").replace("&nbsp;", " ").replace(" ", " ")
@@ -1146,14 +1149,23 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
             company = pick_match.group(2).strip()
             ticker = pick_match.group(3)
 
-            analyst_picks.append(
-                {
-                    "analyst": None,  # filled in below
-                    "signal": sig,
-                    "ticker": ticker,
-                    "company": company,
-                }
-            )
+            # Extract analyst rationale from paragraphs following this pick heading
+            paras = re.findall(r"<p[^>]*>(.*?)</p>", following_html, re.DOTALL)
+            rationale_parts = []
+            for p in paras:
+                text = re.sub(r"<[^>]+>", "", p).strip()
+                text = re.sub(r"\s+", " ", text)
+                if text and text not in ("\xa0", "&nbsp;", " "):
+                    rationale_parts.append(text)
+            rationale = " ".join(rationale_parts)[:800]
+
+            analyst_picks.append({
+                "analyst": None,  # filled in below
+                "signal": sig,
+                "ticker": ticker,
+                "company": company,
+                "rationale": rationale,
+            })
 
         # Assign analysts BEFORE filtering: 3 analysts × 6 picks each = 18 total
         # The Bull always has exactly this structure: first 6 = analyst 1, etc.
@@ -1179,18 +1191,18 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
             item_id = hashlib.sha256(
                 f"bull_{pick['ticker']}_{pick['analyst']}_{article_id}".encode()
             ).hexdigest()[:16]
-            items.append(
-                {
-                    "id": item_id,
-                    "source": "The Bull 18 Share Tips",
-                    "source_title": f"{pick['signal']}: {pick['ticker']} ({pick['analyst']})",
-                    "source_link": article_url,
-                    "title": f"{pick['signal']}: {pick['ticker']} ({pick['company']})",
-                    "summary": f"{pick['analyst']} rates {pick['ticker']} a {pick['signal']}",
-                    "date": datetime.now(timezone.utc).isoformat(),
-                    "signal_hint": pick["signal"],
-                }
-            )
+            analyst_label = f"{pick['analyst']} rates {pick['ticker']} a {pick['signal']}"
+            items.append({
+                "id": item_id,
+                "source": "The Bull 18 Share Tips",
+                "source_title": f"{pick['signal']}: {pick['ticker']} ({pick['analyst']})",
+                "source_link": article_url,
+                "title": f"{pick['signal']}: {pick['ticker']} ({pick['company']})",
+                "description": f"{analyst_label}. {pick['rationale']}" if pick.get("rationale") else analyst_label,
+                "summary": analyst_label,
+                "date": datetime.now(timezone.utc).isoformat(),
+                "signal_hint": pick["signal"],
+            })
 
         log.info(
             f"  The Bull: {len(items)} picks extracted ({len(analyst_picks)} raw, "
