@@ -6,3 +6,6 @@ data/youtube_cache.json
 *.pyc
 *.bak
 .DS_Store
+
+# Secrets — use AGENTMAIL_API_KEY env var instead
+config.json

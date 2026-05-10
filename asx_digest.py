@@ -15,6 +15,7 @@ import urllib.parse
 import smtplib
 import xml.etree.ElementTree as ET
 import hashlib
+import html as _html
 import logging
 import concurrent.futures
 import random
@@ -36,6 +37,10 @@ from youtube_cache import (
     save_cache as save_yt_cache,
     update_entry as update_yt_entry,
 )
+
+def h(text) -> str:
+    """Escape text for safe HTML interpolation."""
+    return _html.escape(str(text or ""))
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -62,7 +67,13 @@ YT_SLEEP_RANGE = (3.0, 6.0)
 # ── Config & State ────────────────────────────────────────────────────────────
 def load_config():
     with open(CONFIG_FILE) as f:
-        return json.load(f)
+        config = json.load(f)
+    # Load AgentMail API key from env var if not set in config
+    agentmail = config.get("agentmail", {})
+    if not agentmail.get("api_key"):
+        agentmail["api_key"] = os.environ.get("AGENTMAIL_API_KEY", "")
+        config["agentmail"] = agentmail
+    return config
 
 def load_state():
     if STATE_FILE.exists():
@@ -85,8 +96,10 @@ def save_state(state):
         ]
         if not state["historical_picks"][ticker]:
             del state["historical_picks"][ticker]
-    with open(STATE_FILE, "w") as f:
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_FILE)
 
 
 # ── YouTube Transcript Extraction ─────────────────────────────────────────────
@@ -1500,7 +1513,7 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
         html_parts.append(
             f"<div style='background:#f0f4ff;padding:12px 16px;border-radius:6px;margin-bottom:12px;'>"
             f"<b style='font-size:13px;color:#555;'>{narrative_header}</b>"
-            f"<p style='margin:6px 0 4px 0;font-size:14px;color:#222;'>{narrative}</p>"
+            f"<p style='margin:6px 0 4px 0;font-size:14px;color:#222;'>{h(narrative)}</p>"
         )
         if sentiment:
             sent_color = {"bullish": "#27ae60", "cautiously bullish": "#2ecc71",
@@ -1518,7 +1531,7 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
         f"<b style='font-size:13px;'>⛏️ Mining Pulse</b> "
         f"<span style='background:{mp_color};color:white;font-size:11px;padding:2px 7px;border-radius:10px;margin-left:6px;'>"
         f"{mining_pulse.get('signal','quiet').upper()}</span>"
-        f"<p style='margin:6px 0 0 0;font-size:13px;color:#444;'>{mining_pulse.get('reason','')}</p>"
+        f"<p style='margin:6px 0 0 0;font-size:13px;color:#444;'>{h(mining_pulse.get('reason',''))}</p>"
         f"</div>"
     )
 
@@ -1531,7 +1544,7 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
             html_parts.append(
                 f"<tr><td style='padding:4px 8px;font-weight:bold;width:120px;'>{s['name']}</td>"
                 f"<td style='color:{sig_color};width:24px;'>{arrow}</td>"
-                f"<td style='color:#555;padding:4px;'>{s['reason']}</td></tr>"
+                f"<td style='color:#555;padding:4px;'>{h(s['reason'])}</td></tr>"
             )
         html_parts.append("</table></div>")
 
@@ -1547,14 +1560,14 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
                 f"<tr><td style='padding:3px 8px;width:130px;'>{c['name']}</td>"
                 f"<td style='font-weight:bold;width:100px;'>{price_str}</td>"
                 f"<td style='color:{chg_color};width:60px;'>{chg_str}</td>"
-                f"<td style='color:#888;'>{c.get('note','')}</td></tr>"
+                f"<td style='color:#888;'>{h(c.get('note',''))}</td></tr>"
             )
         html_parts.append("</table></div>")
 
     # Buzz topics
     if buzz_topics:
         topic_pills = " ".join(
-            f"<span style='background:#e8f4fd;color:#2980b9;padding:2px 8px;border-radius:10px;font-size:11px;margin:2px;display:inline-block;'>{t}</span>"
+            f"<span style='background:#e8f4fd;color:#2980b9;padding:2px 8px;border-radius:10px;font-size:11px;margin:2px;display:inline-block;'>{h(t)}</span>"
             for t in buzz_topics
         )
         html_parts.append(
@@ -1593,20 +1606,20 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
         if alignment and alignment != "—":
             parts.append(f"<br><span style='font-size:11px;color:#666;'>{alignment}</span>")
         if s.get("summary"):
-            parts.append(f"<p style='margin:8px 0 4px 0;font-size:14px;color:#222;'><b>Thesis:</b> {s['summary']}</p>")
+            parts.append(f"<p style='margin:8px 0 4px 0;font-size:14px;color:#222;'><b>Thesis:</b> {h(s['summary'])}</p>")
         if s.get("catalysts"):
             parts.append("<p style='margin:6px 0 2px 0;font-size:12px;font-weight:bold;color:#555;'>Catalysts</p><ul style='margin:0;padding-left:18px;font-size:13px;color:#333;'>")
             for c in s["catalysts"]:
-                parts.append(f"<li>{c}</li>")
+                parts.append(f"<li>{h(c)}</li>")
             parts.append("</ul>")
         if s.get("risks"):
             parts.append("<p style='margin:6px 0 2px 0;font-size:12px;font-weight:bold;color:#c0392b;'>Risks</p><ul style='margin:0;padding-left:18px;font-size:13px;color:#555;'>")
             for r in s["risks"]:
-                parts.append(f"<li>{r}</li>")
+                parts.append(f"<li>{h(r)}</li>")
             parts.append("</ul>")
         if s.get("source_quotes"):
             parts.append("<p style='margin:6px 0 2px 0;font-size:12px;font-weight:bold;color:#555;'>Key Quote</p>")
-            parts.append(f"<p style='margin:2px 0;font-size:12px;color:#444;font-style:italic;'>&#8220;{s['source_quotes'][0]}&#8221;</p>")
+            parts.append(f"<p style='margin:2px 0;font-size:12px;color:#444;font-style:italic;'>&#8220;{h(s['source_quotes'][0])}&#8221;</p>")
         parts.append("<p style='margin:6px 0 0 0;'>")
         for m in s["mentions"]:
             if m.get("source_link"):
