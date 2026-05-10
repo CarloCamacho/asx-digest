@@ -184,7 +184,7 @@ def fetch_channel_items(feed_url: str, source_name: str, max_items: int) -> list
             except ValueError:
                 pub_iso = None
 
-        item_id = hashlib.md5((title + video_url).encode()).hexdigest()
+        item_id = hashlib.md5((title + video_url).encode(), usedforsecurity=False).hexdigest()
         items.append(
             {
                 "id": item_id,

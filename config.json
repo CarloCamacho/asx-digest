@@ -128,5 +128,6 @@
     "max_age_hours": 168
   },
   "claude_cli_path": "/Users/ianf/.local/bin/claude",
+  "claude_model": "claude-haiku-4-5-20251001",
   "dry_run": false
 }

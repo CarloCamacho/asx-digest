@@ -60,8 +60,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DRY_RUN = "--dry-run" in sys.argv
-CACHE_ONLY = "--cache-only" in sys.argv
 YT_SLEEP_RANGE = (3.0, 6.0)
 AEST = ZoneInfo("Australia/Sydney")
 _BOT_UA = "Python/ASXDigest"
@@ -72,11 +70,15 @@ _SCRAPER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.3
 def load_config():
     with open(CONFIG_FILE) as f:
         config = json.load(f)
-    # Load AgentMail API key from env var if not set in config
+    # Load secrets/paths from env vars if not set in config
     agentmail = config.get("agentmail", {})
     if not agentmail.get("api_key"):
         agentmail["api_key"] = os.environ.get("AGENTMAIL_API_KEY", "")
         config["agentmail"] = agentmail
+    if not config.get("claude_cli_path"):
+        config["claude_cli_path"] = os.environ.get("CLAUDE_CLI_PATH", "claude")
+    if not config.get("claude_model"):
+        config["claude_model"] = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
     return config
 
 def load_state():
@@ -100,6 +102,11 @@ def save_state(state):
         ]
         if not state["historical_picks"][ticker]:
             del state["historical_picks"][ticker]
+    # Prune seen_ids to last 500 per source to prevent unbounded growth
+    for src in state.get("seen_ids", {}):
+        ids = state["seen_ids"][src]
+        if len(ids) > 500:
+            state["seen_ids"][src] = ids[-500:]
     tmp = STATE_FILE.with_suffix(".json.tmp")
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
@@ -221,7 +228,6 @@ def parse_rss(xml_text, source_name, max_age_hours, seen_ids):
             desc_el = find_first(entry, ["description", "summary", "atom:summary", "content:encoded"])
             description = ""
             if desc_el is not None and desc_el.text:
-                import re
                 description = re.sub(r"<[^>]+>", " ", desc_el.text).strip()[:1000]
 
             # Date
@@ -244,7 +250,7 @@ def parse_rss(xml_text, source_name, max_age_hours, seen_ids):
             if pub_date and pub_date < cutoff:
                 continue
 
-            item_id = hashlib.md5((title + link).encode()).hexdigest()
+            item_id = hashlib.md5((title + link).encode(), usedforsecurity=False).hexdigest()
             source_seen = seen_ids.get(source_name, set())
             if isinstance(source_seen, list):
                 source_seen = set(source_seen)
@@ -370,7 +376,7 @@ def fetch_asx_announcements(seen_ids, max_age_hours):
             if pub_date and pub_date < cutoff:
                 continue
 
-            item_id = hashlib.md5((ticker + headline).encode()).hexdigest()
+            item_id = hashlib.md5((ticker + headline).encode(), usedforsecurity=False).hexdigest()
             if item_id in source_seen:
                 continue
 
@@ -477,7 +483,7 @@ def fetch_price_signals(extra_tickers=None, seen_ids=None):
         if not signals:
             continue
 
-        item_id = hashlib.md5((ticker + today_str).encode()).hexdigest()
+        item_id = hashlib.md5((ticker + today_str).encode(), usedforsecurity=False).hexdigest()
         if item_id in source_seen:
             continue
 
@@ -651,7 +657,7 @@ Rules:
 - Output ONLY the JSON line, nothing else"""
 
 
-def run_intelligence_pass(all_items, snapshot, run_mode, claude_path):
+def run_intelligence_pass(all_items, snapshot, run_mode, claude_path, claude_model="claude-haiku-4-5-20251001"):
     """Pass 1: single Claude call producing market intelligence context.
     Returns a dict with narrative, mining_pulse, sectors, commodities, buzz_topics, sentiment.
     Returns a safe fallback dict on failure.
@@ -683,7 +689,7 @@ def run_intelligence_pass(all_items, snapshot, run_mode, claude_path):
 
     try:
         result = subprocess.run(
-            [claude_path, "--print", "--model", "claude-haiku-4-5-20251001"],
+            [claude_path, "--print", "--model", claude_model],
             input=prompt, capture_output=True, text=True, timeout=90
         )
         if result.returncode != 0:
@@ -802,7 +808,7 @@ def fetch_asic_shorts(seen_ids=None):
         if not flags:
             continue
 
-        item_id = hashlib.md5(f"asic_short_{ticker}_{d.strftime('%Y%m%d')}".encode()).hexdigest()[:12]
+        item_id = hashlib.md5(f"asic_short_{ticker}_{d.strftime('%Y%m%d')}".encode(), usedforsecurity=False).hexdigest()[:12]
         if item_id in source_seen:
             continue
 
@@ -851,7 +857,7 @@ def fetch_director_trades(tickers=None, seen_ids=None):
                     "change of director", "appendix 3y", "director interest"
                 ]):
                     doc_key = ann.get("documentKey", "")
-                    item_id = hashlib.md5(f"dir_{ticker}_{doc_key}".encode()).hexdigest()[:12]
+                    item_id = hashlib.md5(f"dir_{ticker}_{doc_key}".encode(), usedforsecurity=False).hexdigest()[:12]
                     if item_id not in source_seen:
                         results.append({
                             "ticker": ticker,
@@ -938,8 +944,8 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
             pass
 
         # Dedup check
-        article_id = hashlib.sha256(article_url.encode()).hexdigest()[:16]
-        if article_id in seen_ids.get("The Bull 18 Share Tips", []):
+        article_id = hashlib.sha256(article_url.encode(), usedforsecurity=False).hexdigest()[:16]
+        if article_id in set(seen_ids.get("The Bull 18 Share Tips", [])):
             log.info("  The Bull: already seen")
             return items
 
@@ -1097,7 +1103,7 @@ def looks_like_stock_pick(item):
         return has_strong or has_weak
 
 
-def analyze_batch(items, claude_path, batch_size=5, market_context=""):
+def analyze_batch(items, claude_path, batch_size=5, market_context="", claude_model="claude-haiku-4-5-20251001"):
     """Analyze a batch of items in a single Claude call. Returns list of picks."""
     if not items:
         return []
@@ -1117,7 +1123,7 @@ def analyze_batch(items, claude_path, batch_size=5, market_context=""):
     )
     try:
         result = subprocess.run(
-            [claude_path, "--print", "--model", "claude-haiku-4-5-20251001"],
+            [claude_path, "--print", "--model", claude_model],
             input=prompt, capture_output=True, text=True, timeout=120
         )
         if result.returncode != 0:
@@ -1159,8 +1165,8 @@ def analyze_batch(items, claude_path, batch_size=5, market_context=""):
             return []
         mid = len(items) // 2
         return (
-            analyze_batch(items[:mid], claude_path, batch_size, market_context) +
-            analyze_batch(items[mid:], claude_path, batch_size, market_context)
+            analyze_batch(items[:mid], claude_path, batch_size, market_context, claude_model) +
+            analyze_batch(items[mid:], claude_path, batch_size, market_context, claude_model)
         )
     except Exception as e:
         log.warning(f"Claude batch error: {e}")
@@ -1713,6 +1719,8 @@ def send_email(plain, html, subject, config):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    DRY_RUN = "--dry-run" in sys.argv
+    CACHE_ONLY = "--cache-only" in sys.argv
     log.info(f"=== ASXDigest run started {'(DRY RUN)' if DRY_RUN else ''} ===")
     config = load_config()
     state = load_state()
@@ -1720,6 +1728,7 @@ def main():
     max_age = config["thresholds"]["max_age_hours"]
     max_items = config["thresholds"]["max_items_per_source"]
     claude = config["claude_cli_path"]
+    claude_model = config.get("claude_model", "claude-haiku-4-5-20251001")
 
     # Determine run mode (morning briefing vs evening wrap-up) based on current hour in AEST
     now_aest = datetime.now(timezone.utc).astimezone(AEST)
@@ -1883,21 +1892,11 @@ def main():
         save_state(state)
         return
 
-    # ── Mark all items as seen immediately ──
-    for item in all_new_items:
-        src_name = item["source"]
-        if src_name not in seen_ids:
-            seen_ids[src_name] = []
-        if isinstance(seen_ids[src_name], set):
-            seen_ids[src_name] = list(seen_ids[src_name])
-        if item["id"] not in seen_ids[src_name]:
-            seen_ids[src_name].append(item["id"])
-
     # ── Pass 1: Market Intelligence ──
     intel = {}
     if all_new_items or snapshot:
         log.info("Running market intelligence pass (Pass 1)...")
-        intel = run_intelligence_pass(all_new_items, snapshot, run_mode, claude)
+        intel = run_intelligence_pass(all_new_items, snapshot, run_mode, claude, claude_model)
         log.info(f"  Sentiment: {intel.get('sentiment','?')} | Mining: {intel.get('mining_pulse',{}).get('signal','?')}")
 
     # Build market context string for Pass 2
@@ -1926,12 +1925,10 @@ def main():
         batch = filtered_items[i:i + batch_size]
         n_batches = (len(filtered_items) - 1) // batch_size + 1
         log.info(f"  Batch {i // batch_size + 1}/{n_batches} ({len(batch)} items)...")
-        picks = analyze_batch(batch, claude, batch_size, market_context)
+        picks = analyze_batch(batch, claude, batch_size, market_context, claude_model)
         if picks:
             log.info(f"    → {len(picks)} pick(s): {[p['ticker'] for p in picks]}")
         all_picks.extend(picks)
-
-    state["seen_ids"] = seen_ids
 
     # Send if there are picks, OR if the mining pulse / sectors are notable
     mining_signal = intel.get("mining_pulse", {}).get("signal", "quiet")
@@ -1951,19 +1948,6 @@ def main():
     aggregated = aggregate_picks(all_picks, min_src, historical_picks)
     log.info(f"Aggregated: {len(aggregated)} unique stocks "
              f"({sum(1 for s in aggregated if s['high_conviction'])} high conviction)")
-    
-    # Record current picks to historical_picks for future inter-day correlation
-    now_iso = datetime.now(timezone.utc).isoformat()
-    for pick in all_picks:
-        ticker = pick.get("ticker", "").upper().strip()
-        if ticker and 2 <= len(ticker) <= 5:
-            if ticker not in state.get("historical_picks", {}):
-                state["historical_picks"][ticker] = []
-            state["historical_picks"][ticker].append({
-                "source": pick.get("source", ""),
-                "timestamp": now_iso,
-                "signal": pick.get("signal", "BUY"),
-            })
     
     assign_sector_alignment(aggregated, intel)
 
@@ -1988,14 +1972,44 @@ def main():
     if DRY_RUN:
         log.info("DRY RUN — printing digest, not sending email:")
         print("\n" + plain)
+        email_sent = True
     else:
+        email_sent = False
         try:
             send_email(plain, html, subject, config)
+            email_sent = True
         except Exception as e:
             log.error(f"Email send failed: {e}")
             log.info("Digest (not sent):\n" + plain)
 
-    save_state(state)
+    if email_sent:
+        # Mark items as seen and record picks only after successful send
+        for item in all_new_items:
+            src_name = item["source"]
+            if src_name not in seen_ids:
+                seen_ids[src_name] = []
+            if isinstance(seen_ids[src_name], set):
+                seen_ids[src_name] = list(seen_ids[src_name])
+            if item["id"] not in seen_ids[src_name]:
+                seen_ids[src_name].append(item["id"])
+        state["seen_ids"] = seen_ids
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for pick in all_picks:
+            ticker = pick.get("ticker", "").upper().strip()
+            if ticker and 2 <= len(ticker) <= 5:
+                if ticker not in state.get("historical_picks", {}):
+                    state["historical_picks"][ticker] = []
+                state["historical_picks"][ticker].append({
+                    "source": pick.get("source", ""),
+                    "timestamp": now_iso,
+                    "signal": pick.get("signal", "BUY"),
+                })
+
+        save_state(state)
+    else:
+        log.warning("Email failed — items not marked as seen and will be retried on next run")
+
     log.info(f"=== ASXDigest run complete ===")
 
 
