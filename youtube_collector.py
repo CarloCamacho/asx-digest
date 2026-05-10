@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import logging
 import random
@@ -115,6 +116,8 @@ def fetch_channel_items(feed_url: str, source_name: str, max_items: int) -> list
         "noplaylist": False,
         "nocheckcertificate": True,
         "retries": 2,
+        "socket_timeout": 15,
+        "http_timeout": 15,
     }
 
     entries: list[dict] = []
@@ -241,7 +244,16 @@ def main(argv: Iterable[str] | None = None) -> int:
         url = src.get("url")
         name = src.get("name", key)
         LOG.info("[YTCOL] Fetching %s...", name)
-        items = fetch_channel_items(url, name, max_items)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(fetch_channel_items, url, name, max_items)
+                items = future.result(timeout=120)
+        except concurrent.futures.TimeoutError:
+            LOG.warning("[YTCOL] Timeout fetching %s after 120s — skipping", name)
+            continue
+        except Exception as exc:
+            LOG.warning("[YTCOL] Error fetching %s: %s", name, exc)
+            continue
         if not items:
             LOG.warning("[YTCOL] Fetch yielded no items for %s", name)
             continue

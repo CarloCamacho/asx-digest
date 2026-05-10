@@ -5,3 +5,4 @@ state.json*
 data/youtube_cache.json
 *.pyc
 *.bak
+.DS_Store

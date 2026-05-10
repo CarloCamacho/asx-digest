@@ -19,7 +19,10 @@ import logging
 import concurrent.futures
 import random
 import time
+import io
+import csv
 from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -64,11 +67,24 @@ def load_config():
 def load_state():
     if STATE_FILE.exists():
         with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"seen_ids": {}, "last_run": None}
+            state = json.load(f)
+        # Ensure historical_picks key exists for older state files
+        if "historical_picks" not in state:
+            state["historical_picks"] = {}
+        return state
+    return {"seen_ids": {}, "last_run": None, "historical_picks": {}}
 
 def save_state(state):
     state["last_run"] = datetime.now(timezone.utc).isoformat()
+    # Prune historical_picks older than 7 days
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    for ticker in list(state.get("historical_picks", {}).keys()):
+        state["historical_picks"][ticker] = [
+            entry for entry in state["historical_picks"][ticker]
+            if entry.get("timestamp", "") >= cutoff
+        ]
+        if not state["historical_picks"][ticker]:
+            del state["historical_picks"][ticker]
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
@@ -696,9 +712,323 @@ def run_intelligence_pass(all_items, snapshot, run_mode, claude_path):
         return fallback
 
 
+# ── ASIC Short Interest ────────────────────────────────────────────────────────
+ASIC_SHORT_SELL_URL = "https://download.asic.gov.au/short-selling/RR{date}-001-SSDailyYTD.csv"
+ASIC_SHORT_PCT_THRESHOLD = 5.0  # Flag stocks shorted > 5%
+ASIC_CHANGE_THRESHOLD = 1.0     # Flag day-over-day change > 1%
+
+def fetch_asic_shorts(seen_ids=None):
+    """Download daily ASIC short position CSV, flag >5% shorted and big movers."""
+    if seen_ids is None:
+        seen_ids = {}
+    source_name = "ASIC Short Interest"
+    source_seen = set(seen_ids.get(source_name, []))
+    items = []
+
+    # Try last 7 calendar days to find latest available (T+4 lag, business days only)
+    now = datetime.now(timezone.utc)
+    for days_back in range(0, 10):
+        d = now - timedelta(days=days_back)
+        date_str = d.strftime("%Y%m%d")
+        url = ASIC_SHORT_SELL_URL.format(date=date_str)
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+            })
+            raw = urllib.request.urlopen(req, timeout=15).read().decode("utf-8")
+            if raw and "Product Code" in raw:
+                break  # Found a valid CSV
+        except Exception:
+            continue
+    else:
+        log.warning("ASIC short sell CSV not found for last 10 days")
+        return items
+
+    reader = csv.reader(io.StringIO(raw))
+    rows = list(reader)
+    if len(rows) < 3:
+        return items
+
+    def _parse_pct(val):
+        try:
+            return float(val.strip()) if val.strip() not in ("-", "", "N/A") else None
+        except ValueError:
+            return None
+
+    # Column 3 = % for newest date, column 5 = % for previous date
+    today_pct_idx = 3
+    yesterday_pct_idx = 5
+
+    ticker_col = 1
+
+    for row in rows[2:]:
+        if len(row) <= max(today_pct_idx, yesterday_pct_idx):
+            continue
+        ticker = row[ticker_col].strip()
+        name = row[0].strip()
+
+        # Skip ETFs, warrants, and options (typically have longer tickers or ETF in name)
+        if "ETF" in name.upper() or len(ticker) > 5:
+            continue
+
+        today_pct = _parse_pct(row[today_pct_idx])
+        yesterday_pct = _parse_pct(row[yesterday_pct_idx])
+
+        if today_pct is None:
+            continue
+
+        flags = []
+        if today_pct >= ASIC_SHORT_PCT_THRESHOLD:
+            flags.append(f"{today_pct:.1f}% shorted")
+        if yesterday_pct is not None and abs(today_pct - yesterday_pct) >= ASIC_CHANGE_THRESHOLD:
+            direction = "↑" if today_pct > yesterday_pct else "↓"
+            flags.append(f"{direction}{abs(today_pct - yesterday_pct):.1f}% change")
+
+        if not flags:
+            continue
+
+        item_id = hashlib.md5(f"asic_short_{ticker}_{d.strftime('%Y%m%d')}".encode()).hexdigest()[:12]
+        if item_id in source_seen:
+            continue
+
+        description = f"{name} ({ticker}): " + ", ".join(flags)
+        if yesterday_pct is not None:
+            description += f" (prev: {yesterday_pct:.1f}%)"
+
+        items.append({
+            "id": item_id,
+            "title": f"Short Interest: {ticker} — {today_pct:.1f}% of issued capital",
+            "link": f"https://asic.gov.au/regulatory-resources/markets/short-selling/short-position-reports-table/",
+            "description": description,
+            "source": source_name,
+            "pub_date": d.isoformat(),
+        })
+
+    log.info(f"  ASIC shorts: {len(items)} flagged ({len(rows)-2} stocks scanned)")
+    return items
+
+
+# ── Director Transactions (ASX Markit Digital API) ────────────────────────────
+ASX_MARKIT_API = "https://asx.api.markitdigital.com/asx-research/1.0/companies/{ticker}/announcements?count=20"
+
+def fetch_director_trades(tickers=None, seen_ids=None):
+    """Query ASX Markit Digital API for Appendix 3Y / Director Interest notices."""
+    if seen_ids is None:
+        seen_ids = {}
+    if tickers is None:
+        tickers = ASX_TOP_STOCKS
+    source_name = "Director Trades"
+    source_seen = set(seen_ids.get(source_name, []))
+
+    def _check_one(ticker):
+        try:
+            url = ASX_MARKIT_API.format(ticker=ticker)
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+            })
+            raw = urllib.request.urlopen(req, timeout=10).read()
+            data = json.loads(raw)
+            announcements = data.get("data", {}).get("items", [])
+            results = []
+            for ann in announcements:
+                headline = ann.get("headline", "").lower()
+                if any(term in headline for term in [
+                    "change of director", "appendix 3y", "director interest"
+                ]):
+                    doc_key = ann.get("documentKey", "")
+                    item_id = hashlib.md5(f"dir_{ticker}_{doc_key}".encode()).hexdigest()[:12]
+                    if item_id not in source_seen:
+                        results.append({
+                            "ticker": ticker,
+                            "headline": ann.get("headline", ""),
+                            "date": ann.get("date", ""),
+                            "is_price_sensitive": ann.get("isPriceSensitive", False),
+                            "doc_key": doc_key,
+                            "item_id": item_id,
+                        })
+            return results
+        except Exception as e:
+            log.debug(f"Director check failed for {ticker}: {e}")
+            return []
+
+    items = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        all_results = list(executor.map(_check_one, tickers))
+    for results in all_results:
+        for r in results:
+            date_str = r["date"][:10] if r["date"] else ""
+            items.append({
+                "id": r["item_id"],
+                "title": f"Director Trade: {r['ticker']} — {r['headline']}",
+                "link": f"https://www.asx.com.au/asx/statistics/announcements.do?by=asxCode&asxCode={r['ticker']}&timeframe=W&period=M1",
+                "description": f"Director interest notice filed for {r['ticker']} on {date_str}. "
+                               f"{'Price-sensitive.' if r['is_price_sensitive'] else ''}",
+                "source": source_name,
+                "pub_date": r["date"] if r["date"] else datetime.now(timezone.utc).isoformat(),
+                "ticker_hint": r["ticker"],
+            })
+    log.info(f"  Director trades: {len(items)} notices found across {len(tickers)} stocks")
+    return items
+
+
+# ── The Bull 18 Share Tips ─────────────────────────────────────────────────────
+def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
+    """Fetch the latest 18 Share Tips article from The Bull, extract broker ratings.
+
+    The Bull publishes weekly on Mondays with 3 analysts × 6 picks each
+    (2 Buys, 2 Holds, 2 Sells). Ticker codes are in parentheses in H4 headings:
+        BUY – Deep Yellow (DYL)
+    """
+    seen_ids = seen_ids or {}
+    items = []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+
+    try:
+        # Step 1: Parse RSS feed for the most recent article
+        rss_url = "https://thebull.com.au/category/18-share-tips/feed/"
+        req = urllib.request.Request(rss_url, headers={"User-Agent": "ASXDigest/2.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            rss_xml = resp.read().decode("utf-8", errors="replace")
+
+        # Parse RSS items
+        root = ET.fromstring(rss_xml)
+        rss_items = []
+        for item in root.findall(".//item"):
+            title_el = item.find("title")
+            link_el = item.find("link")
+            pub_el = item.find("pubDate")
+            if title_el is not None and link_el is not None:
+                rss_items.append({
+                    "title": title_el.text or "",
+                    "link": link_el.text or "",
+                    "pub_date": pub_el.text if pub_el is not None else "",
+                })
+
+        if not rss_items:
+            log.info("  The Bull: no RSS items found")
+            return items
+
+        # Use the most recent article
+        latest = rss_items[0]
+        article_title = latest["title"]
+        article_url = latest["link"]
+
+        # Parse pub_date for age check
+        try:
+            pub_dt = parsedate_to_datetime(latest["pub_date"])
+            if pub_dt < cutoff:
+                log.info(f"  The Bull: latest article too old ({latest['pub_date']})")
+                return items
+        except Exception:
+            pass
+
+        # Dedup check
+        article_id = hashlib.sha256(article_url.encode()).hexdigest()[:16]
+        if article_id in seen_ids.get("The Bull 18 Share Tips", []):
+            log.info("  The Bull: already seen")
+            return items
+
+        # Step 2: Fetch the article HTML
+        req2 = urllib.request.Request(article_url, headers={"User-Agent": "ASXDigest/2.0"})
+        with urllib.request.urlopen(req2, timeout=15) as resp2:
+            html = resp2.read().decode("utf-8", errors="replace")
+
+        # Step 3: Extract article body
+        article_match = re.search(r"<article(.*?)</article>", html, re.DOTALL)
+        if not article_match:
+            log.warning("  The Bull: could not find <article> tag")
+            return items
+        article_html = article_match.group(0)
+
+        # Step 4: Extract analyst sections and their picks
+        # Structure: H4 headings contain <span>BUY – </span>Company (TICKER)
+        # Strip all HTML tags first, then match patterns on clean text
+        h4_headings_raw = re.findall(r"<h4[^>]*>(.*?)</h4>", article_html, re.DOTALL)
+
+        # Group into analyst sections by tracking H2 positions
+        h2_names = []
+        for m in re.finditer(r"<h2[^>]*>(.*?)</h2>", article_html, re.DOTALL):
+            name = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+            # Skip non-analyst H2s
+            if name and not any(skip in name.lower() for skip in
+                                ("early access", "table of", "featured", "roundup",
+                                 "top australian", "broker", "subscribe")):
+                h2_names.append(name)
+
+        analyst_picks = []
+
+        for raw_h4 in h4_headings_raw:
+            # Strip all HTML tags and decode entities
+            clean = re.sub(r"<[^>]+>", "", raw_h4).strip()
+            clean = clean.replace("\xa0", " ").replace("&nbsp;", " ").replace(" ", " ")
+            clean = re.sub(r"\s+", " ", clean)
+
+            # Check if actual pick: "BUY – Company (TICKER)" or "HOLD – Company (TICKER)"
+            # Skip section headers like "BUY RECOMMENDATIONS"
+            pick_match = re.match(r"^(BUY|SELL|HOLD)\s*[–\-]\s*(.+?)\s*\(([A-Z0-9]{2,5})\)\s*$", clean, re.IGNORECASE)
+            if not pick_match:
+                continue
+
+            sig = pick_match.group(1).upper()
+            company = pick_match.group(2).strip()
+            ticker = pick_match.group(3)
+
+            analyst_picks.append({
+                "analyst": None,  # filled in below
+                "signal": sig,
+                "ticker": ticker,
+                "company": company,
+            })
+
+        # Assign analysts BEFORE filtering: 3 analysts × 6 picks each = 18 total
+        # The Bull always has exactly this structure: first 6 = analyst 1, etc.
+        for i, pick in enumerate(analyst_picks):
+            if i < 6 and len(h2_names) > 0:
+                pick["analyst"] = h2_names[0]
+            elif i < 12 and len(h2_names) > 1:
+                pick["analyst"] = h2_names[1]
+            elif len(h2_names) > 2:
+                pick["analyst"] = h2_names[2]
+            else:
+                pick["analyst"] = "Unknown"
+
+        # Now filter out ETFs and other exclusions
+        analyst_picks = [p for p in analyst_picks if p["ticker"] not in ("FUEL",)]
+
+        # Step 5: Generate items
+        for pick in analyst_picks:
+            item_id = hashlib.sha256(
+                f"bull_{pick['ticker']}_{pick['analyst']}_{article_id}".encode()
+            ).hexdigest()[:16]
+            items.append({
+                "id": item_id,
+                "source": "The Bull 18 Share Tips",
+                "source_title": f"{pick['signal']}: {pick['ticker']} ({pick['analyst']})",
+                "source_link": article_url,
+                "title": f"{pick['signal']}: {pick['ticker']} ({pick['company']})",
+                "summary": f"{pick['analyst']} rates {pick['ticker']} a {pick['signal']}",
+                "date": datetime.now(timezone.utc).isoformat(),
+                "signal_hint": pick["signal"],
+            })
+
+        log.info(f"  The Bull: {len(items)} picks extracted ({len(analyst_picks)} raw, "
+                 f"{len(set(p['analyst'] for p in analyst_picks))} analysts)")
+    except urllib.error.URLError as e:
+        log.warning(f"  The Bull: HTTP error — {e}")
+    except ET.ParseError as e:
+        log.warning(f"  The Bull: RSS parse error — {e}")
+    except Exception as e:
+        log.warning(f"  The Bull: unexpected error — {e}")
+
+    return items
+
+
 # Pre-filter: only analyze items that look like they contain stock picks
 # Tier 1 — sources that are inherently signals (always include)
-AUTO_INCLUDE_SOURCES = {"ASX Announcements", "Price Signals", "r/ASX_Bets"}
+AUTO_INCLUDE_SOURCES = {"ASX Announcements", "Price Signals", "r/ASX_Bets",
+                         "ASIC Short Interest", "Director Trades",
+                         "r/AusFinance", "r/ASX", "r/ausstocks",
+                         "The Bull 18 Share Tips"}
 
 # Sources that require strict ASX ticker pattern (high-noise, low-pick-rate)
 STRICT_FILTER_SOURCES = {"ABC Business", "SMH Business"}
@@ -820,9 +1150,49 @@ def analyze_batch(items, claude_path, batch_size=5, market_context=""):
         return []
 
 
+# ── Source Type Classification ─────────────────────────────────────────────────
+# Maps source names to type categories for conviction explanation.
+# Different source types agreeing = stronger signal than same-type agreement.
+SOURCE_TYPE_MAP = {
+    # Professional analyst / research
+    "Stocks Down Under": "analyst",
+    "Stockhead": "analyst",
+    "The Market Herald": "analyst",
+    "ShareCafe": "analyst",
+    "Motley Fool Australia": "analyst",
+    "Wealth Within (YouTube)": "analyst",
+    "Livewire Markets (YouTube)": "analyst",
+    "Rask (YouTube)": "analyst",
+    "Finer Market Points (YouTube)": "analyst",
+    "Australian Stock Report (YouTube)": "analyst",
+    "CommSecTV (YouTube)": "analyst",
+    "The Bull 18 Share Tips": "analyst",
+    # Retail / social sentiment
+    "r/ASX_Bets": "retail",
+    "r/AusFinance": "retail",
+    "r/ASX": "retail",
+    "r/ausstocks": "retail",
+    # Insider / regulatory data
+    "Director Trades": "insider",
+    "ASIC Short Interest": "short_data",
+    "ASX Announcements": "regulatory",
+    # News / media
+    "ABC Business": "news",
+    "SMH Business": "news",
+    "Mining.com": "news",
+    # Technical / price data
+    "Price Signals": "price_signal",
+}
+
+
 # ── Aggregation ───────────────────────────────────────────────────────────────
-def aggregate_picks(all_picks, min_sources_for_high_conviction):
-    """Group picks by ticker, count sources, flag high conviction."""
+def aggregate_picks(all_picks, min_sources_for_high_conviction, historical_picks=None):
+    """Group picks by ticker, count sources, flag high conviction.
+    
+    Also checks historical_picks (7-day rolling window) to identify stocks
+    that have been picked by different sources across multiple days.
+    """
+    historical_picks = historical_picks or {}
     by_ticker = defaultdict(list)
     for pick in all_picks:
         ticker = pick.get("ticker", "").upper().strip()
@@ -830,9 +1200,39 @@ def aggregate_picks(all_picks, min_sources_for_high_conviction):
             by_ticker[ticker].append(pick)
 
     aggregated = []
+    now = datetime.now(timezone.utc)
     for ticker, picks in by_ticker.items():
         sources = list({p["source"] for p in picks})
         best = max(picks, key=lambda p: {"HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(p.get("confidence", "LOW"), 1))
+        
+        # Check historical picks for this ticker (different sources in last 7 days)
+        hist_sources = set()
+        for entry in historical_picks.get(ticker, []):
+            # Only count picks from different sources than current run
+            if entry.get("source") not in sources:
+                hist_sources.add(entry["source"])
+        
+        # Combine current and historical sources for conviction check
+        combined_sources = sources + list(hist_sources)
+        unique_combined = list(set(combined_sources))
+
+        # Classify source types for conviction explanation
+        all_source_names = sources + list(hist_sources)
+        source_types = list({
+            SOURCE_TYPE_MAP.get(s, "general") for s in all_source_names
+        })
+        type_labels = {
+            "analyst": "Professional analyst",
+            "retail": "Retail sentiment",
+            "insider": "Director buying",
+            "short_data": "Short interest data",
+            "regulatory": "Regulatory filings",
+            "news": "News media",
+            "price_signal": "Price/technical signals",
+            "general": "Other",
+        }
+        type_names = [type_labels.get(t, t.title()) for t in source_types]
+
         aggregated.append({
             "ticker": ticker,
             "company": best.get("company", ""),
@@ -844,7 +1244,10 @@ def aggregate_picks(all_picks, min_sources_for_high_conviction):
             "source_quotes": best.get("source_quotes", []),
             "sources": sources,
             "source_count": len(sources),
-            "high_conviction": len(sources) >= min_sources_for_high_conviction,
+            "source_types": source_types,
+            # High conviction if: 2+ CURRENT sources OR (1 current + 1+ historical from different source)
+            "high_conviction": len(unique_combined) >= min_sources_for_high_conviction,
+            "historical_sources": list(hist_sources),
             "mentions": picks,
         })
 
@@ -880,9 +1283,7 @@ def assign_sector_alignment(aggregated, intel):
             return "Energy", sector_signals.get("energy", "")
         if ticker in financials_tickers:
             return "Financials", sector_signals.get("financials", "")
-        # Check active sectors
-        for sname, ssig in sector_signals.items():
-            return sname.title(), ssig
+        # Check active sectors for matching keyword in ticker name
         return None, None
 
     for stock in aggregated:
@@ -900,6 +1301,50 @@ def assign_sector_alignment(aggregated, intel):
         else:
             stock["sector_alignment"] = "diverges"
             stock["sector_alignment_label"] = f"⚠️ Diverges from {sector_name} ({sector_sig})"
+
+
+# ── Conviction Explanation ────────────────────────────────────────────────────
+def build_conviction_explanation(stock):
+    """Generate a one-line explanation of WHY a stock has high conviction.
+
+    Emphasizes source type diversity and multi-day corroboration over raw count.
+    Two analyst reports agreeing is noise; analyst + director buying + Reddit
+    buzz is a signal worth paying attention to.
+    """
+    source_types = stock.get("source_types", [])
+    hist_sources = stock.get("historical_sources", [])
+    source_count = stock.get("source_count", len(stock.get("sources", [])))
+    total_src = source_count + len(hist_sources)
+
+    if not source_types:
+        return ""
+
+    type_count = len(source_types)
+    has_historical = bool(hist_sources)
+
+    # Base explanation on type diversity
+    if type_count >= 3:
+        type_desc = f"{type_count} distinct source types agree"
+    elif type_count == 2:
+        labels = {
+            "analyst": "Analyst",
+            "retail": "Retail",
+            "insider": "Director",
+            "short_data": "Shorts",
+            "news": "News",
+            "price_signal": "Technicals",
+            "regulatory": "Filings",
+        }
+        names = [labels.get(t, t.title()) for t in source_types]
+        type_desc = f"{names[0]} + {names[1]} agree"
+    else:
+        type_desc = f"{total_src} sources agree"
+
+    # Add multi-day indicator
+    if has_historical:
+        type_desc += " across multiple days"
+
+    return "📊 " + type_desc
 
 
 # ── Email Formatting ──────────────────────────────────────────────────────────
@@ -978,7 +1423,20 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
     def format_pick_plain(s, source_label):
         out = []
         out.append(f"  {s['ticker']} ({s['company']}) — {s['signal']}")
-        out.append(f"  {source_label}: {', '.join(s['sources'])}")
+        
+        # Conviction explanation for high conviction picks
+        if s.get("high_conviction"):
+            explanation = build_conviction_explanation(s)
+            if explanation:
+                out.append(f"  {explanation}")
+        
+        # Show sources, including historical ones for high conviction picks
+        sources_text = ', '.join(s['sources'])
+        hist_sources = s.get('historical_sources', [])
+        if hist_sources:
+            sources_text += f" (plus {', '.join(hist_sources)} from previous runs)"
+        out.append(f"  {source_label}: {sources_text}")
+        
         alignment = s.get("sector_alignment_label", "")
         if alignment and alignment != "—":
             out.append(f"  Sector: {alignment}")
@@ -997,7 +1455,7 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
         if s.get("source_quotes"):
             out.append("  Key Quote:")
             for q in s["source_quotes"][:1]:
-                out.append(f"    \"{q}\"")
+                out.append(f'    "{q}"')
         for m in s["mentions"]:
             if m.get("source_link"):
                 out.append(f"  [{m['source']}] {m['source_title'][:70]}")
@@ -1005,7 +1463,7 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
         return out
 
     if high:
-        lines.append("🔥 HIGH CONVICTION (2+ sources)\n")
+        lines.append("🔥 HIGH CONVICTION (2+ sources or multi-day correlation)\n")
         for s in high:
             lines.extend(format_pick_plain(s, "Sources"))
 
@@ -1119,7 +1577,19 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
         ]
         if s.get("price_target"):
             parts.append(f" <span style='color:#888;font-size:12px;margin-left:6px;'>🎯 {s['price_target']}</span>")
-        parts.append(f"<br><span style='color:#666;font-size:12px;'>{'  ·  '.join(s['sources'])}</span>")
+        # Conviction explanation for high conviction picks
+        if s.get("high_conviction"):
+            explanation = build_conviction_explanation(s)
+            if explanation:
+                parts.append(
+                    f"<br><span style='color:#c0392b;font-size:13px;font-weight:bold;'>{explanation}</span>"
+                )
+        # Show sources including historical for high conviction picks
+        sources_display = ', '.join(s['sources'])
+        hist_sources = s.get('historical_sources', [])
+        if hist_sources:
+            sources_display += f" (plus {', '.join(hist_sources)} from prior runs)"
+        parts.append(f"<br><span style='color:#666;font-size:12px;'>{sources_display}</span>")
         if alignment and alignment != "—":
             parts.append(f"<br><span style='font-size:11px;color:#666;'>{alignment}</span>")
         if s.get("summary"):
@@ -1148,7 +1618,7 @@ def format_email(aggregated, run_time, intel=None, run_mode="morning"):
         return "".join(parts)
 
     if high:
-        html_parts.append("<h3 style='color:#c0392b;'>🔥 HIGH CONVICTION — 2+ Sources</h3>")
+        html_parts.append("<h3 style='color:#c0392b;'>🔥 HIGH CONVICTION — 2+ sources or multi-day correlation</h3>")
         for s in high:
             html_parts.append(format_pick_html(s, border_width="4px"))
 
@@ -1234,9 +1704,12 @@ def main():
     max_items = config["thresholds"]["max_items_per_source"]
     claude = config["claude_cli_path"]
 
-    # Determine run mode (morning briefing vs evening wrap-up)
-    run_mode = "morning" if datetime.now().hour < 12 else "evening"
-    log.info(f"Run mode: {run_mode}")
+    # Determine run mode (morning briefing vs evening wrap-up) based on current hour in AEST
+    now_aest = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=11)))
+    hour = now_aest.hour
+    # Morning run: 6-11am, Evening run: 3-8pm (handles 8AM and 5PM cron times with buffer)
+    run_mode = "morning" if 6 <= hour < 15 else "evening"
+    log.info(f"Run mode: {run_mode} (AEST hour: {hour})")
 
     # Fetch market snapshot concurrently (runs alongside RSS fetches below)
     snapshot = {}
@@ -1310,24 +1783,41 @@ def main():
         raise SystemExit(2)
 
     # ── Reddit ──
-    reddit_cfg = config["sources"].get("asx_bets_reddit", {})
-    if reddit_cfg.get("enabled"):
-        log.info("Fetching r/ASX_Bets...")
+    reddit_subs = {
+        "r/ASX_Bets": {
+            "urls": ["https://www.reddit.com/r/ASX_Bets/hot.json", "https://www.reddit.com/r/ASX_Bets/new.json"],
+            "min_upvotes": 2,
+        },
+        "r/AusFinance": {
+            "urls": ["https://www.reddit.com/r/AusFinance/hot.json"],
+            "min_upvotes": 5,
+        },
+        "r/ASX": {
+            "urls": ["https://www.reddit.com/r/ASX/hot.json"],
+            "min_upvotes": 2,
+        },
+        "r/ausstocks": {
+            "urls": ["https://www.reddit.com/r/ausstocks/hot.json"],
+            "min_upvotes": 1,
+        },
+    }
+    for sub_name, sub_cfg in reddit_subs.items():
+        log.info(f"Fetching {sub_name}...")
         items = []
-        for url in [reddit_cfg["url"], reddit_cfg.get("url_new", "")]:
+        for url in sub_cfg["urls"]:
             if url:
-                items.extend(fetch_reddit(url, reddit_cfg["name"], max_age, seen_ids))
-        # Dedupe within reddit items by id
+                items.extend(fetch_reddit(url, sub_name, max_age, seen_ids))
+        # Dedupe within subreddit items by id
         seen_r = set()
         deduped = []
         for it in items:
             if it["id"] not in seen_r:
                 seen_r.add(it["id"])
                 deduped.append(it)
-        # Filter low-engagement posts (upvotes < 5 for hot, < 2 for new)
-        deduped = [i for i in deduped if i.get("upvotes", 0) >= 2]
+        # Filter low-engagement posts
+        deduped = [i for i in deduped if i.get("upvotes", 0) >= sub_cfg["min_upvotes"]]
         deduped = deduped[:max_items]
-        log.info(f"  {len(deduped)} new Reddit items")
+        log.info(f"  {len(deduped)} new items from {sub_name}")
         all_new_items.extend(deduped)
 
     # ── ASX Official Announcements ──
@@ -1351,6 +1841,21 @@ def main():
         log.info("Scanning for price signals (Yahoo Finance)...")
         price_items = fetch_price_signals(extra_tickers=ann_tickers, seen_ids=seen_ids)
         all_new_items.extend(price_items)
+
+    # ── ASIC Short Interest ──
+    log.info("Fetching ASIC short interest data...")
+    short_items = fetch_asic_shorts(seen_ids=seen_ids)
+    all_new_items.extend(short_items)
+
+    # ── Director Transactions ──
+    log.info("Fetching director transactions...")
+    director_items = fetch_director_trades(tickers=ASX_TOP_STOCKS, seen_ids=seen_ids)
+    all_new_items.extend(director_items)
+
+    # ── The Bull 18 Share Tips ──
+    log.info("Fetching The Bull 18 Share Tips...")
+    bull_items = fetch_bull_share_tips(seen_ids=seen_ids, max_age_hours=max_age)
+    all_new_items.extend(bull_items)
 
     # ── P0: Enrich YouTube items with transcripts ──
     if all_new_items:
@@ -1425,9 +1930,24 @@ def main():
 
     # ── Aggregation ──
     min_src = config["thresholds"]["high_conviction_min_sources"]
-    aggregated = aggregate_picks(all_picks, min_src)
+    historical_picks = state.get("historical_picks", {})
+    aggregated = aggregate_picks(all_picks, min_src, historical_picks)
     log.info(f"Aggregated: {len(aggregated)} unique stocks "
              f"({sum(1 for s in aggregated if s['high_conviction'])} high conviction)")
+    
+    # Record current picks to historical_picks for future inter-day correlation
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for pick in all_picks:
+        ticker = pick.get("ticker", "").upper().strip()
+        if ticker and 2 <= len(ticker) <= 5:
+            if ticker not in state.get("historical_picks", {}):
+                state["historical_picks"][ticker] = []
+            state["historical_picks"][ticker].append({
+                "source": pick.get("source", ""),
+                "timestamp": now_iso,
+                "signal": pick.get("signal", "BUY"),
+            })
+    
     assign_sector_alignment(aggregated, intel)
 
     # ── Format & Send ──

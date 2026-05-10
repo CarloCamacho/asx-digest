@@ -5,10 +5,7 @@
     "smtp_port": 587,
     "from_address": "YOUR_GMAIL@gmail.com",
     "app_password": "YOUR_GMAIL_APP_PASSWORD",
-    "recipients": [
-      "ian.franklin@outlook.com",
-      "Kelly.Franklin@outlook.com.au"
-    ]
+    "recipients": ["ian.franklin@outlook.com", "Kelly.Franklin@outlook.com.au"]
   },
   "agentmail": {
     "_note": "Alternative to Gmail. Set method to 'agentmail' and fill these in.",
@@ -27,27 +24,15 @@
       "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCdLzNzag8APY4tx6GHYN2Lg",
       "name": "Livewire Markets (YouTube)"
     },
-    "market_index_youtube": {
-      "enabled": false,
-      "_note": "Channel not found \u2014 handle @marketindexau returned 404. Re-enable if correct ID is found.",
-      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCFx0MkMB5e_Zx3R9lc6T1eg",
-      "name": "Market Index (YouTube)"
-    },
     "rask_youtube": {
       "enabled": true,
-      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCzyu1ypvynNH6Q2l_YqVoaw",
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCvOPFdkhCBIK2Y5QbDtOZXA",
       "name": "Rask (YouTube)"
     },
     "finer_market_points_youtube": {
       "enabled": true,
       "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC7N0NPq6REt_F7HOQOGgC9Q",
       "name": "Finer Market Points (YouTube)"
-    },
-    "motley_fool_au_youtube": {
-      "enabled": false,
-      "_note": "Channel not found \u2014 handle @MotleyFoolAustralia returned 404. Re-enable if correct ID is found.",
-      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC-wsjOQTA1f3_oYrJxjEqwA",
-      "name": "Motley Fool Australia (YouTube)"
     },
     "asr_youtube": {
       "enabled": true,
@@ -124,7 +109,18 @@
   },
   "market_snapshot": {
     "enabled": true,
-    "symbols": ["^AXJO", "^AXMJ", "^AXEJ", "^AXFJ", "GC=F", "HG=F", "BZ=F", "ZW=F", "PLS.AX", "AUDUSD=X"]
+    "symbols": [
+      "^AXJO",
+      "^AXMJ",
+      "^AXEJ",
+      "^AXFJ",
+      "GC=F",
+      "HG=F",
+      "BZ=F",
+      "ZW=F",
+      "PLS.AX",
+      "AUDUSD=X"
+    ]
   },
   "thresholds": {
     "high_conviction_min_sources": 2,

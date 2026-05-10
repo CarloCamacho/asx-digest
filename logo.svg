@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400" width="800" height="400">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0a1628"/>
+      <stop offset="100%" style="stop-color:#152238"/>
+    </linearGradient>
+    <linearGradient id="goldGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#d4a843"/>
+      <stop offset="100%" style="stop-color:#f0d68a"/>
+    </linearGradient>
+    <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#00a86b"/>
+      <stop offset="100%" style="stop-color:#00d68f"/>
+    </linearGradient>
+    <linearGradient id="lineGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" style="stop-color:#00d68f;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#00a86b;stop-opacity:0.3"/>
+    </linearGradient>
+    <linearGradient id="lineGlow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" style="stop-color:#00ffaa;stop-opacity:0.6"/>
+      <stop offset="100%" style="stop-color:#00ffaa;stop-opacity:0"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glowStrong">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="400" rx="16" fill="url(#bgGrad)"/>
+
+  <!-- Grid lines -->
+  <g opacity="0.06" stroke="#fff" stroke-width="0.5">
+    <line x1="160" y1="0" x2="160" y2="400"/>
+    <line x1="320" y1="0" x2="320" y2="400"/>
+    <line x1="480" y1="0" x2="480" y2="400"/>
+    <line x1="640" y1="0" x2="640" y2="400"/>
+    <line x1="0" y1="100" x2="800" y2="100"/>
+    <line x1="0" y1="200" x2="800" y2="200"/>
+    <line x1="0" y1="300" x2="800" y2="300"/>
+  </g>
+
+  <!-- Chart area -->
+  <g transform="translate(480, 80)">
+    <!-- Chart background -->
+    <rect x="0" y="0" width="290" height="220" rx="6" fill="#0d1f3c" opacity="0.6"/>
+
+    <!-- Chart grid -->
+    <g opacity="0.08" stroke="#00a86b" stroke-width="0.5">
+      <line x1="0" y1="55" x2="290" y2="55"/>
+      <line x1="0" y1="110" x2="290" y2="110"/>
+      <line x1="0" y1="165" x2="290" y2="165"/>
+    </g>
+
+    <!-- Volume bars (bottom) -->
+    <g opacity="0.15" fill="#00a86b">
+      <rect x="5" y="185" width="12" height="20" rx="1"/>
+      <rect x="25" y="180" width="12" height="25" rx="1"/>
+      <rect x="45" y="178" width="12" height="27" rx="1"/>
+      <rect x="65" y="185" width="12" height="20" rx="1"/>
+      <rect x="85" y="175" width="12" height="30" rx="1"/>
+      <rect x="105" y="172" width="12" height="33" rx="1"/>
+      <rect x="125" y="180" width="12" height="25" rx="1"/>
+      <rect x="145" y="170" width="12" height="35" rx="1"/>
+      <rect x="165" y="168" width="12" height="37" rx="1"/>
+      <rect x="185" y="175" width="12" height="30" rx="1"/>
+      <rect x="205" y="165" width="12" height="40" rx="1"/>
+      <rect x="225" y="160" width="12" height="45" rx="1"/>
+      <rect x="245" y="170" width="12" height="35" rx="1"/>
+      <rect x="265" y="158" width="12" height="47" rx="1"/>
+    </g>
+
+    <!-- Candlestick chart (trending up) -->
+    <g>
+      <!-- Bearish candle (red) -->
+      <line x1="15" y1="145" x2="15" y2="175" stroke="#ff4444" stroke-width="1"/>
+      <rect x="8" y="148" width="14" height="14" fill="#ff4444" rx="1"/>
+
+      <!-- Bearish -->
+      <line x1="55" y1="138" x2="55" y2="170" stroke="#ff4444" stroke-width="1"/>
+      <rect x="48" y="142" width="14" height="15" fill="#ff4444" rx="1"/>
+
+      <!-- Doji -->
+      <line x1="95" y1="135" x2="95" y2="165" stroke="#aaa" stroke-width="1"/>
+      <rect x="88" y="148" width="14" height="2" fill="#aaa" rx="1"/>
+
+      <!-- Bullish (green) -->
+      <line x1="135" y1="115" x2="135" y2="155" stroke="#00d68f" stroke-width="1"/>
+      <rect x="128" y="128" width="14" height="15" fill="#00d68f" rx="1"/>
+
+      <!-- Bullish -->
+      <line x1="175" y1="102" x2="175" y2="142" stroke="#00d68f" stroke-width="1"/>
+      <rect x="168" y="115" width="14" height="16" fill="#00d68f" rx="1"/>
+
+      <!-- Bullish -->
+      <line x1="215" y1="88" x2="215" y2="130" stroke="#00d68f" stroke-width="1"/>
+      <rect x="208" y="100" width="14" height="18" fill="#00d68f" rx="1"/>
+
+      <!-- Strong bullish -->
+      <line x1="255" y1="70" x2="255" y2="115" stroke="#00d68f" stroke-width="1.5"/>
+      <rect x="246" y="82" width="18" height="22" fill="#00d68f" rx="2"/>
+    </g>
+
+    <!-- Trend line -->
+    <path d="M 8,160 Q 60,150 95,152 Q 130,130 175,118 Q 220,95 273,70"
+          fill="none" stroke="url(#lineGrad)" stroke-width="2.5" opacity="0.8"/>
+
+    <!-- Trend glow -->
+    <path d="M 8,160 Q 60,150 95,152 Q 130,130 175,118 Q 220,95 273,70"
+          fill="none" stroke="#00ffaa" stroke-width="8" opacity="0.15" filter="url(#glowStrong)"/>
+
+    <!-- Arrow at end -->
+    <polygon points="270,68 282,70 270,76" fill="#00d68f" opacity="0.9"/>
+  </g>
+
+  <!-- Main title -->
+  <text x="50" y="120" font-family="'Helvetica Neue', Arial, sans-serif" font-size="64" font-weight="800" fill="url(#goldGrad)" letter-spacing="6">ASX</text>
+
+  <!-- DIGEST subtitle -->
+  <text x="50" y="175" font-family="'Helvetica Neue', Arial, sans-serif" font-size="28" font-weight="300" fill="#8899aa" letter-spacing="12">D I G E S T</text>
+
+  <!-- Tagline -->
+  <text x="50" y="220" font-family="'Helvetica Neue', Arial, sans-serif" font-size="12" fill="#556677" letter-spacing="2">STOCK TIP AGGREGATOR · MULTI-SOURCE ANALYSIS · DAILY BRIEFING</text>
+
+  <!-- Decorative divider -->
+  <line x1="50" y1="240" x2="430" y2="240" stroke="url(#goldGrad)" stroke-width="1" opacity="0.3"/>
+
+  <!-- Source count badge -->
+  <g transform="translate(50, 270)">
+    <rect x="0" y="0" width="140" height="32" rx="16" fill="#0d1f3c" stroke="#294466" stroke-width="0.5"/>
+    <text x="70" y="21" font-family="'Helvetica Neue', Arial, sans-serif" font-size="11" fill="#00d68f" text-anchor="middle" font-weight="600">20+ DATA SOURCES</text>
+  </g>
+
+  <!-- AI powered badge -->
+  <g transform="translate(200, 270)">
+    <rect x="0" y="0" width="110" height="32" rx="16" fill="#0d1f3c" stroke="#294466" stroke-width="0.5"/>
+    <text x="55" y="21" font-family="'Helvetica Neue', Arial, sans-serif" font-size="11" fill="#d4a843" text-anchor="middle" font-weight="600">AI-POWERED</text>
+  </g>
+
+  <!-- Email badge -->
+  <g transform="translate(320, 270)">
+    <rect x="0" y="0" width="100" height="32" rx="16" fill="#0d1f3c" stroke="#294466" stroke-width="0.5"/>
+    <text x="50" y="21" font-family="'Helvetica Neue', Arial, sans-serif" font-size="11" fill="#8899aa" text-anchor="middle" font-weight="600">EMAIL DIGEST</text>
+  </g>
+
+  <!-- Footer -->
+  <text x="400" y="380" font-family="'Helvetica Neue', Arial, sans-serif" font-size="10" fill="#334455" text-anchor="middle" letter-spacing="1">AUSTRALIAN SECURITIES EXCHANGE · MARKET INTELLIGENCE · TWICE DAILY</text>
+</svg>

@@ -8,7 +8,7 @@ from typing import Any, Dict
 
 BASE_DIR = Path(__file__).parent
 DEFAULT_CACHE_PATH = BASE_DIR / "data" / "youtube_cache.json"
-DEFAULT_FRESH_MINUTES = 90
+DEFAULT_FRESH_MINUTES = 720
 
 
 def _ensure_datetime(value: str | None) -> datetime | None:
