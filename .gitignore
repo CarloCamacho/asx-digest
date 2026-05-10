@@ -7,5 +7,6 @@ data/youtube_cache.json
 *.bak
 .DS_Store
 
-# Secrets — use AGENTMAIL_API_KEY env var instead
+# Secrets — use .env for local keys (see .env.example)
 config.json
+.env
