@@ -731,12 +731,12 @@ NEWS ITEMS (title + excerpt):
 {items}
 
 Output exactly ONE JSON object on a single line with this schema:
-{{"narrative":"2-3 sentences. Morning: outlook/watchpoints. Evening: what happened today.","mining_pulse":{{"signal":"bullish|bearish|mixed|quiet","reason":"1-2 sentences on mining/resources sector with specific data points"}},"sectors":[{{"name":"sector name","signal":"bullish|bearish|mixed","reason":"specific reason with numbers"}}],"commodities":[{{"name":"commodity name","price_aud":0.00,"change_pct":0.00,"note":"optional 1-line significance"}}],"buzz_topics":["topic1","topic2"],"sentiment":"bullish|cautiously bullish|mixed|cautiously bearish|bearish|neutral"}}
+{{"narrative":"2-3 sentences. Morning: outlook/watchpoints. Evening: what happened today.","mining_pulse":{{"signal":"bullish|bearish|mixed|quiet","reason":"1-2 sentences on mining/resources sector with specific data points"}},"sectors":[{{"name":"sector name","signal":"bullish|bearish|mixed","reason":"specific reason with numbers"}}],"commodities":[{{"name":"commodity name","price_aud":0.00,"change_pct":0.00,"note":"required 1-line note — use news context if available, else interpret the price/change (e.g. near multi-year high, momentum stalling, safe-haven bid)"}}],"buzz_topics":["topic1","topic2"],"sentiment":"bullish|cautiously bullish|mixed|cautiously bearish|bearish|neutral"}}
 
 Rules:
 - mining_pulse MUST always be present even if quiet (signal: "quiet", reason: "No notable moves in mining or resources today")
 - sectors: only include sectors with meaningful movement — omit flat sectors entirely
-- commodities: include ALL commodities from the snapshot with their AUD prices and day change
+- commodities: include ALL commodities from the snapshot with their AUD prices and day change; note field is REQUIRED for every commodity — use news items for context first, then derive from price trend/change magnitude if no news
 - buzz_topics: 3-6 recurring themes or names appearing across multiple items
 - Output ONLY the JSON line, nothing else"""
 
