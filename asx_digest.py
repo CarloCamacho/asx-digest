@@ -704,10 +704,10 @@ Fields:
 - confidence: HIGH/MEDIUM/LOW
 - item_index: which item it came from (0-based)
 - summary: 2-3 sentences covering the core thesis with specific facts (numbers, deals, catalysts)
-- catalysts: list of 2-4 specific upcoming catalysts or reasons to watch
+- catalysts: list of 2-4 specific catalysts or reasons to watch with concrete details (dates, figures, events); if fewer than 2 specific catalysts exist in the source, only list what is there — do not pad with generic sector commentary
 - risks: list of 1-2 key risks if mentioned, else empty list
 - price_target: analyst price target if stated, else null
-- source_quotes: list of 1-2 verbatim key quotes or data points from the source
+- source_quotes: list of 1-2 verbatim key quotes or specific data points from the source; if no direct quote, use the most specific claim, number, or fact from the item — never use just the headline
 - sector_play: true if this is a broad sector call rather than a specific stock (optional, omit if false)
 
 Rules:
@@ -731,12 +731,12 @@ NEWS ITEMS (title + excerpt):
 {items}
 
 Output exactly ONE JSON object on a single line with this schema:
-{{"narrative":"2-3 sentences. Morning: outlook/watchpoints. Evening: what happened today.","mining_pulse":{{"signal":"bullish|bearish|mixed|quiet","reason":"1-2 sentences on mining/resources sector with specific data points"}},"sectors":[{{"name":"sector name","signal":"bullish|bearish|mixed","reason":"specific reason with numbers"}}],"commodities":[{{"name":"commodity name","price_aud":0.00,"change_pct":0.00,"note":"optional 1-line significance"}}],"buzz_topics":["topic1","topic2"],"sentiment":"bullish|cautiously bullish|mixed|cautiously bearish|bearish|neutral"}}
+{{"narrative":"2-3 sentences. Morning: outlook/watchpoints. Evening: what happened today.","mining_pulse":{{"signal":"bullish|bearish|mixed|quiet","reason":"1-2 sentences on mining/resources sector with specific data points"}},"sectors":[{{"name":"sector name","signal":"bullish|bearish|mixed","reason":"1-2 sentences with specific data points or stock moves driving the signal"}}],"commodities":[{{"name":"commodity name","price_aud":0.00,"change_pct":0.00,"note":"required 1-line note — use news context if available, else interpret the price/change (e.g. near multi-year high, momentum stalling, safe-haven bid)"}}],"buzz_topics":["topic1","topic2"],"sentiment":"bullish|cautiously bullish|mixed|cautiously bearish|bearish|neutral"}}
 
 Rules:
 - mining_pulse MUST always be present even if quiet (signal: "quiet", reason: "No notable moves in mining or resources today")
 - sectors: only include sectors with meaningful movement — omit flat sectors entirely
-- commodities: include ALL commodities from the snapshot with their AUD prices and day change
+- commodities: include ALL commodities from the snapshot with their AUD prices and day change; note field is REQUIRED for every commodity — use news items for context first, then derive from price trend/change magnitude if no news
 - buzz_topics: 3-6 recurring themes or names appearing across multiple items
 - Output ONLY the JSON line, nothing else"""
 
@@ -768,7 +768,7 @@ def run_intelligence_pass(
     item_lines = []
     for i, item in enumerate(all_items[:60]):  # cap at 60 items for prompt length
         title = item.get("title", "")
-        desc = (item.get("description", "") or "")[:150].replace("\n", " ")
+        desc = (item.get("description", "") or "")[:300].replace("\n", " ")
         item_lines.append(f"[{i}] {title} — {desc}")
     items_text = "\n".join(item_lines)
 
@@ -1102,8 +1102,11 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
 
         # Step 4: Extract analyst sections and their picks
         # Structure: H4 headings contain <span>BUY – </span>Company (TICKER)
-        # Strip all HTML tags first, then match patterns on clean text
-        h4_headings_raw = re.findall(r"<h4[^>]*>(.*?)</h4>", article_html, re.DOTALL)
+        # Capture each H4 + the paragraphs that follow it (analyst rationale)
+        h4_sections = re.findall(
+            r"<h4[^>]*>(.*?)</h4>(.*?)(?=<h4|<h2|</article>)",
+            article_html, re.DOTALL
+        )
 
         # Group into analyst sections by tracking H2 positions
         h2_names = []
@@ -1126,7 +1129,7 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
 
         analyst_picks = []
 
-        for raw_h4 in h4_headings_raw:
+        for raw_h4, following_html in h4_sections:
             # Strip all HTML tags and decode entities
             clean = re.sub(r"<[^>]+>", "", raw_h4).strip()
             clean = clean.replace("\xa0", " ").replace("&nbsp;", " ").replace(" ", " ")
@@ -1146,14 +1149,23 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
             company = pick_match.group(2).strip()
             ticker = pick_match.group(3)
 
-            analyst_picks.append(
-                {
-                    "analyst": None,  # filled in below
-                    "signal": sig,
-                    "ticker": ticker,
-                    "company": company,
-                }
-            )
+            # Extract analyst rationale from paragraphs following this pick heading
+            paras = re.findall(r"<p[^>]*>(.*?)</p>", following_html, re.DOTALL)
+            rationale_parts = []
+            for p in paras:
+                text = re.sub(r"<[^>]+>", "", p).strip()
+                text = re.sub(r"\s+", " ", text)
+                if text and text not in ("\xa0", "&nbsp;", " "):
+                    rationale_parts.append(text)
+            rationale = " ".join(rationale_parts)[:800]
+
+            analyst_picks.append({
+                "analyst": None,  # filled in below
+                "signal": sig,
+                "ticker": ticker,
+                "company": company,
+                "rationale": rationale,
+            })
 
         # Assign analysts BEFORE filtering: 3 analysts × 6 picks each = 18 total
         # The Bull always has exactly this structure: first 6 = analyst 1, etc.
@@ -1179,18 +1191,18 @@ def fetch_bull_share_tips(seen_ids=None, max_age_hours=168):
             item_id = hashlib.sha256(
                 f"bull_{pick['ticker']}_{pick['analyst']}_{article_id}".encode()
             ).hexdigest()[:16]
-            items.append(
-                {
-                    "id": item_id,
-                    "source": "The Bull 18 Share Tips",
-                    "source_title": f"{pick['signal']}: {pick['ticker']} ({pick['analyst']})",
-                    "source_link": article_url,
-                    "title": f"{pick['signal']}: {pick['ticker']} ({pick['company']})",
-                    "summary": f"{pick['analyst']} rates {pick['ticker']} a {pick['signal']}",
-                    "date": datetime.now(timezone.utc).isoformat(),
-                    "signal_hint": pick["signal"],
-                }
-            )
+            analyst_label = f"{pick['analyst']} rates {pick['ticker']} a {pick['signal']}"
+            items.append({
+                "id": item_id,
+                "source": "The Bull 18 Share Tips",
+                "source_title": f"{pick['signal']}: {pick['ticker']} ({pick['analyst']})",
+                "source_link": article_url,
+                "title": f"{pick['signal']}: {pick['ticker']} ({pick['company']})",
+                "description": f"{analyst_label}. {pick['rationale']}" if pick.get("rationale") else analyst_label,
+                "summary": analyst_label,
+                "date": datetime.now(timezone.utc).isoformat(),
+                "signal_hint": pick["signal"],
+            })
 
         log.info(
             f"  The Bull: {len(items)} picks extracted ({len(analyst_picks)} raw, "
