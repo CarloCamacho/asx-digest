@@ -704,10 +704,10 @@ Fields:
 - confidence: HIGH/MEDIUM/LOW
 - item_index: which item it came from (0-based)
 - summary: 2-3 sentences covering the core thesis with specific facts (numbers, deals, catalysts)
-- catalysts: list of 2-4 specific upcoming catalysts or reasons to watch
+- catalysts: list of 2-4 specific catalysts or reasons to watch with concrete details (dates, figures, events); if fewer than 2 specific catalysts exist in the source, only list what is there — do not pad with generic sector commentary
 - risks: list of 1-2 key risks if mentioned, else empty list
 - price_target: analyst price target if stated, else null
-- source_quotes: list of 1-2 verbatim key quotes or data points from the source
+- source_quotes: list of 1-2 verbatim key quotes or specific data points from the source; if no direct quote, use the most specific claim, number, or fact from the item — never use just the headline
 - sector_play: true if this is a broad sector call rather than a specific stock (optional, omit if false)
 
 Rules:
@@ -731,7 +731,7 @@ NEWS ITEMS (title + excerpt):
 {items}
 
 Output exactly ONE JSON object on a single line with this schema:
-{{"narrative":"2-3 sentences. Morning: outlook/watchpoints. Evening: what happened today.","mining_pulse":{{"signal":"bullish|bearish|mixed|quiet","reason":"1-2 sentences on mining/resources sector with specific data points"}},"sectors":[{{"name":"sector name","signal":"bullish|bearish|mixed","reason":"specific reason with numbers"}}],"commodities":[{{"name":"commodity name","price_aud":0.00,"change_pct":0.00,"note":"required 1-line note — use news context if available, else interpret the price/change (e.g. near multi-year high, momentum stalling, safe-haven bid)"}}],"buzz_topics":["topic1","topic2"],"sentiment":"bullish|cautiously bullish|mixed|cautiously bearish|bearish|neutral"}}
+{{"narrative":"2-3 sentences. Morning: outlook/watchpoints. Evening: what happened today.","mining_pulse":{{"signal":"bullish|bearish|mixed|quiet","reason":"1-2 sentences on mining/resources sector with specific data points"}},"sectors":[{{"name":"sector name","signal":"bullish|bearish|mixed","reason":"1-2 sentences with specific data points or stock moves driving the signal"}}],"commodities":[{{"name":"commodity name","price_aud":0.00,"change_pct":0.00,"note":"required 1-line note — use news context if available, else interpret the price/change (e.g. near multi-year high, momentum stalling, safe-haven bid)"}}],"buzz_topics":["topic1","topic2"],"sentiment":"bullish|cautiously bullish|mixed|cautiously bearish|bearish|neutral"}}
 
 Rules:
 - mining_pulse MUST always be present even if quiet (signal: "quiet", reason: "No notable moves in mining or resources today")
@@ -768,7 +768,7 @@ def run_intelligence_pass(
     item_lines = []
     for i, item in enumerate(all_items[:60]):  # cap at 60 items for prompt length
         title = item.get("title", "")
-        desc = (item.get("description", "") or "")[:150].replace("\n", " ")
+        desc = (item.get("description", "") or "")[:300].replace("\n", " ")
         item_lines.append(f"[{i}] {title} — {desc}")
     items_text = "\n".join(item_lines)
 
