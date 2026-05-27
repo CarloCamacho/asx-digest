@@ -113,6 +113,13 @@ def load_config():
         config["claude_model"] = os.environ.get(
             "CLAUDE_MODEL", "claude-haiku-4-5-20251001"
         )
+    # LLM API settings (direct HTTP calls via LiteLLM proxy)
+    if not config.get("api_base_url"):
+        config["api_base_url"] = os.environ.get("api_base_url", "http://192.168.1.111:4000/v1")
+    if not config.get("api_model"):
+        config["api_model"] = os.environ.get("api_model", "deepseek4pro")
+    if not config.get("api_key"):
+        config["api_key"] = os.environ.get("LLM_API_KEY", os.environ.get("HERMES_API_KEY", ""))
     return config
 
 
@@ -741,10 +748,69 @@ Rules:
 - Output ONLY the JSON line, nothing else"""
 
 
+def call_llm_api(prompt, api_base_url, api_model, api_key, timeout=120):
+    """Call an OpenAI-compatible chat completions API directly.
+    Returns the model's text content, or None on failure.
+    Handles reasoning models (deepseek4pro etc.) that put output in reasoning_content.
+    """
+    if not api_key:
+        log.warning("LLM API key not configured")
+        return None
+
+    payload = json.dumps({
+        "model": api_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4096,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{api_base_url}/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        message = data.get("choices", [{}])[0].get("message", {})
+        content = (message.get("content") or "").strip()
+        reasoning = (message.get("reasoning_content") or "").strip()
+
+        # Reasoning models (deepseek4pro, DeepSeek-R1) may put all output
+        # in reasoning_content when content is empty.
+        if not content and reasoning:
+            log.info("LLM API: content empty, using reasoning_content fallback")
+            content = reasoning
+
+        if not content:
+            log.warning("LLM API returned no content (both content and reasoning_content empty)")
+            return None
+
+        return content
+
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            pass
+        log.warning(f"LLM API HTTP {e.code}: {body}")
+        return None
+    except urllib.error.URLError as e:
+        log.warning(f"LLM API connection error: {e}")
+        return None
+    except Exception as e:
+        log.warning(f"LLM API error: {type(e).__name__}: {e}")
+        return None
+
+
 def run_intelligence_pass(
-    all_items, snapshot, run_mode, claude_path, claude_model="claude-haiku-4-5-20251001"
+    all_items, snapshot, run_mode, api_base_url, api_model, api_key
 ):
-    """Pass 1: single Claude call producing market intelligence context.
+    """Pass 1: single LLM API call producing market intelligence context.
     Returns a dict with narrative, mining_pulse, sectors, commodities, buzz_topics, sentiment.
     Returns a safe fallback dict on failure.
     """
@@ -779,21 +845,10 @@ def run_intelligence_pass(
     )
 
     try:
-        result = subprocess.run(
-            [claude_path, "--print", "--model", claude_model],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-        if result.returncode != 0:
-            log.warning(
-                f"Intelligence pass: Claude exited {result.returncode}; stderr: {result.stderr[:300]}"
-            )
-            # Hook failures set exit code 1 but stdout may still be valid — only bail if empty.
-            if not result.stdout.strip():
-                return fallback
-        output = result.stdout.strip()
+        output = call_llm_api(prompt, api_base_url, api_model, api_key, timeout=120)
+        if not output:
+            log.warning("Intelligence pass: LLM API returned no content")
+            return fallback
 
         def _apply_intel_defaults(intel):
             intel.setdefault("narrative", "")
@@ -820,11 +875,8 @@ def run_intelligence_pass(
         except (json.JSONDecodeError, AttributeError):
             pass
         log.warning(
-            f"Intelligence pass: could not parse Claude output as JSON; stderr: {result.stderr[:200]!r}"
+            "Intelligence pass: could not parse LLM output as JSON"
         )
-        return fallback
-    except subprocess.TimeoutExpired:
-        log.warning("Intelligence pass: Claude timeout")
         return fallback
     except Exception as e:
         log.warning(f"Intelligence pass error: {e}")
@@ -1320,12 +1372,13 @@ def looks_like_stock_pick(item):
 
 def analyze_batch(
     items,
-    claude_path,
+    api_base_url,
+    api_model,
+    api_key,
     batch_size=5,
     market_context="",
-    claude_model="claude-haiku-4-5-20251001",
 ):
-    """Analyze a batch of items in a single Claude call. Returns list of picks."""
+    """Analyze a batch of items in a single LLM API call. Returns list of picks."""
     if not items:
         return []
 
@@ -1340,20 +1393,10 @@ def analyze_batch(
     context_block = f"MARKET CONTEXT:\n{market_context}\n" if market_context else ""
     prompt = EXTRACT_PROMPT.format(market_context=context_block, content=content[:6000])
     try:
-        result = subprocess.run(
-            [claude_path, "--print", "--model", claude_model],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            log.warning(f"Claude batch exit {result.returncode}: {result.stderr[:200]}")
-            # Hook failures (e.g. missing node) set exit code 1 but stdout is still valid.
-            # Only bail out if stdout is empty — otherwise fall through and parse it.
-            if not result.stdout.strip():
-                return []
-        output = result.stdout.strip()
+        output = call_llm_api(prompt, api_base_url, api_model, api_key, timeout=120)
+        if not output:
+            log.warning("LLM batch: API returned no content")
+            return []
         picks = []
         for line in output.split("\n"):
             line = line.strip()
@@ -1380,21 +1423,17 @@ def analyze_batch(
                 except json.JSONDecodeError:
                     pass
         return picks
-    except subprocess.TimeoutExpired:
-        log.warning(
-            f"Claude timeout on batch of {len(items)} items — retrying with split batch"
-        )
+    except Exception as e:
+        log.warning(f"LLM batch error: {e}")
+        # On failure, try splitting the batch in half
         if len(items) <= 1:
             return []
         mid = len(items) // 2
         return analyze_batch(
-            items[:mid], claude_path, batch_size, market_context, claude_model
+            items[:mid], api_base_url, api_model, api_key, batch_size, market_context
         ) + analyze_batch(
-            items[mid:], claude_path, batch_size, market_context, claude_model
+            items[mid:], api_base_url, api_model, api_key, batch_size, market_context
         )
-    except Exception as e:
-        log.warning(f"Claude batch error: {e}")
-        return []
 
 
 # ── Source Type Classification ─────────────────────────────────────────────────
@@ -2034,6 +2073,14 @@ def main():
     max_items = config["thresholds"]["max_items_per_source"]
     claude = config["claude_cli_path"]
     claude_model = config.get("claude_model", "claude-haiku-4-5-20251001")
+    api_base_url = config.get("api_base_url", "http://192.168.1.111:4000/v1")
+    api_model = config.get("api_model", "deepseek4pro")
+    api_key = config.get("api_key", "")
+
+    log.info(
+        f"LLM API: {api_base_url} | model: {api_model} | "
+        f"key: {'configured' if api_key else 'MISSING'}"
+    )
 
     # Determine run mode (morning briefing vs evening wrap-up) based on current hour in AEST
     now_aest = datetime.now(timezone.utc).astimezone(AEST)
@@ -2215,7 +2262,7 @@ def main():
     if all_new_items or snapshot:
         log.info("Running market intelligence pass (Pass 1)...")
         intel = run_intelligence_pass(
-            all_new_items, snapshot, run_mode, claude, claude_model
+            all_new_items, snapshot, run_mode, api_base_url, api_model, api_key
         )
         log.info(
             f"  Sentiment: {intel.get('sentiment', '?')} | Mining: {intel.get('mining_pulse', {}).get('signal', '?')}"
@@ -2241,7 +2288,7 @@ def main():
     )
 
     # ── P3: AI Analysis — sequential batches ──
-    log.info(f"Analyzing {len(filtered_items)} items with Claude (batches of 5)...")
+    log.info(f"Analyzing {len(filtered_items)} items with LLM API (batches of 5)...")
 
     all_picks = []
     batch_size = 5
@@ -2249,7 +2296,7 @@ def main():
         batch = filtered_items[i : i + batch_size]
         n_batches = (len(filtered_items) - 1) // batch_size + 1
         log.info(f"  Batch {i // batch_size + 1}/{n_batches} ({len(batch)} items)...")
-        picks = analyze_batch(batch, claude, batch_size, market_context, claude_model)
+        picks = analyze_batch(batch, api_base_url, api_model, api_key, batch_size, market_context)
         if picks:
             log.info(f"    → {len(picks)} pick(s): {[p['ticker'] for p in picks]}")
         all_picks.extend(picks)
